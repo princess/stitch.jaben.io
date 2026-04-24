@@ -78,11 +78,11 @@ function App() {
     const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
     const ffmpeg = ffmpegRef.current;
     
-    ffmpeg.on('progress', ({ progress }) => {
-      // ffmpeg.exec() progress is 0 to 1.
-      // We map this to 15% - 90% of our total progress bar.
-      const mappedProgress = 15 + Math.round(progress * 75);
-      setProgress(mappedProgress);
+    ffmpeg.on('progress', ({ progress: ffmpegProgress }) => {
+      // FFmpeg conversion stage: 15% to 90%
+      const mapped = 15 + Math.floor(ffmpegProgress * 75);
+      // Ensure we don't go backwards if ffmpeg emits late events
+      setProgress(prev => Math.max(prev, mapped));
     });
 
     await ffmpeg.load({
@@ -127,20 +127,19 @@ function App() {
     const ffmpeg = ffmpegRef.current;
 
     try {
-      setStatus('Preparing videos...');
-      setProgress(5);
+      setStatus('Reading files...');
+      setProgress(2);
       const fileNames: string[] = [];
       
       for (let i = 0; i < videos.length; i++) {
         const fileName = `input${i}.mp4`;
         fileNames.push(fileName);
         await ffmpeg.writeFile(fileName, await fetchFile(videos[i].file));
-        // Files are loaded up to 15%
-        setProgress(Math.round(5 + ((i + 1) / videos.length) * 10));
+        // Files loading: 2% to 15%
+        setProgress(Math.round(2 + ((i + 1) / videos.length) * 13));
       }
 
-      setStatus('Stitching clips together...');
-      // Create concat.txt
+      setStatus('Stitching clips...');
       const concatContent = fileNames.map(name => `file '${name}'`).join('\n');
       await ffmpeg.writeFile('concat.txt', concatContent);
 
@@ -150,16 +149,18 @@ function App() {
         '-i', 'concat.txt',
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
-        '-pix_fmt', 'yuv420p', // Critical for iOS/Mobile compatibility
+        '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
         'output.mp4'
       ]);
 
-      setStatus('Generating download...');
-      setProgress(95);
+      setStatus('Generating video file...');
+      setProgress(92);
       const data = await ffmpeg.readFile('output.mp4');
-      const url = URL.createObjectURL(new Blob([data as any], { type: 'video/mp4' }));
+      setProgress(98);
       
+      setStatus('Finished!');
+      const url = URL.createObjectURL(new Blob([data as any], { type: 'video/mp4' }));
       const a = document.createElement('a');
       a.href = url;
       a.download = 'stitched_video.mp4';
@@ -173,11 +174,10 @@ function App() {
       await ffmpeg.deleteFile('output.mp4');
 
       setProgress(100);
-      setStatus('Success!');
       setIsDone(true);
     } catch (error) {
       console.error(error);
-      setStatus('Error: Could not process videos.');
+      setStatus('Error processing videos.');
     } finally {
       setProcessing(false);
     }
@@ -188,7 +188,7 @@ function App() {
       <div className={styles.container}>
         <div className={styles.header}>
           <h1>Stitch</h1>
-          <p>Waking up the engine...</p>
+          <p>Initializing engine...</p>
           <Loader2 className={styles.spinner} size={48} />
         </div>
       </div>
@@ -199,13 +199,13 @@ function App() {
     <div className={styles.container}>
       <div className={styles.header}>
         <h1>Stitch</h1>
-        <p>Combine videos directly in your browser. Private & Secure.</p>
+        <p>Combine videos in your browser. Fast, private, and free.</p>
       </div>
 
       {!processing && !isDone && (
         <div className={styles.dropzone} onClick={() => fileInputRef.current?.click()}>
           <Upload size={48} color="#2563eb" style={{ marginBottom: '1rem' }} />
-          <p>Tap or drag videos to add</p>
+          <p>Tap to add videos</p>
           <input
             type="file"
             multiple
@@ -220,10 +220,10 @@ function App() {
       {isDone && !processing && (
         <div className={styles.successCard}>
           <CheckCircle2 size={48} color="#10b981" />
-          <h2>Done!</h2>
-          <p>Your video has been stitched and downloaded.</p>
+          <h2>Successfully Stitched!</h2>
+          <p>Your download should have started automatically.</p>
           <button onClick={() => setIsDone(false)} className={styles.secondaryBtn}>
-            Stitch More
+            Start New Project
           </button>
         </div>
       )}
@@ -275,7 +275,7 @@ function App() {
               <div className={styles.progressBar}>
                 <div className={styles.progressFill} style={{ width: `${progress}%` }} />
               </div>
-              <p className={styles.status}>{status} {progress}%</p>
+              <p className={styles.status}>{status} ({progress}%)</p>
             </div>
           )}
         </div>
