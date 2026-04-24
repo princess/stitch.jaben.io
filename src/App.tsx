@@ -79,8 +79,11 @@ function App() {
     ffmpeg.on('log', ({ message }) => {
       console.log(message);
     });
+    // The default progress event is only for the ffmpeg.exec() part
     ffmpeg.on('progress', ({ progress }) => {
-      setProgress(Math.round(progress * 100));
+      // Map 0-1 to 10-90 range to account for prep and finalization
+      const mappedProgress = 10 + Math.round(progress * 80);
+      setProgress(mappedProgress);
     });
     await ffmpeg.load({
       coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
@@ -122,12 +125,14 @@ function App() {
 
     try {
       setStatus('Preparing files...');
+      setProgress(2);
       const fileNames: string[] = [];
       
       for (let i = 0; i < videos.length; i++) {
         const fileName = `input${i}.mp4`;
         fileNames.push(fileName);
         await ffmpeg.writeFile(fileName, await fetchFile(videos[i].file));
+        setProgress(Math.round(2 + ((i + 1) / videos.length) * 8)); // Up to 10%
       }
 
       setStatus('Concatenating...');
@@ -146,6 +151,7 @@ function App() {
       ]);
 
       setStatus('Finalizing...');
+      setProgress(95);
       const data = await ffmpeg.readFile('output.mp4');
       const url = URL.createObjectURL(new Blob([data as any], { type: 'video/mp4' }));
       
@@ -161,12 +167,15 @@ function App() {
       await ffmpeg.deleteFile('concat.txt');
       await ffmpeg.deleteFile('output.mp4');
 
+      setProgress(100);
       setStatus('Done!');
     } catch (error) {
       console.error(error);
       setStatus('Error occurred during processing.');
     } finally {
-      setProcessing(false);
+      setTimeout(() => {
+        setProcessing(false);
+      }, 2000);
     }
   };
 
