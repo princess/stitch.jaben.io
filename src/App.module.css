@@ -39,6 +39,10 @@
   transform: scale(0.98);
 }
 
+.dropzoneSmall {
+  padding: 1.5rem;
+}
+
 .videoList {
   display: flex;
   flex-direction: column;
@@ -57,10 +61,19 @@
   box-shadow: 0 1px 2px rgba(0,0,0,0.05);
 }
 
+.disabled {
+  opacity: 0.6;
+  background: #f8fafc;
+}
+
 .dragHandle {
   cursor: grab;
   color: #cbd5e1;
   padding: 0.25rem;
+}
+
+.disabled .dragHandle {
+  cursor: not-allowed;
 }
 
 .fileName {
@@ -186,6 +199,31 @@
   color: #166534;
   opacity: 0.8;
   margin-bottom: 0.5rem;
+}
+
+.errorBanner {
+  background: #fef2f2;
+  border: 1px solid #fee2e2;
+  border-radius: 0.75rem;
+  padding: 1rem;
+  margin-bottom: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: #991b1b;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.closeError {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: #ef4444;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 0.25rem;
 }
 
 .spinner {

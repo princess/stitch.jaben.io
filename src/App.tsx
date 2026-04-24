@@ -1,5 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { WebDemuxer } from 'web-demuxer';
 import {
   DndContext,
   closestCenter,
@@ -25,14 +26,14 @@ interface VideoFile {
   file: File;
 }
 
-const SortableVideoItem = ({ id, file, onRemove }: { id: string; file: File; onRemove: (id: string) => void }) => {
+const SortableVideoItem = ({ id, file, onRemove, disabled }: { id: string; file: File; onRemove: (id: string) => void, disabled?: boolean }) => {
   const {
     attributes,
     listeners,
     setNodeRef,
     transform,
     transition,
-  } = useSortable({ id });
+  } = useSortable({ id, disabled });
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -40,14 +41,16 @@ const SortableVideoItem = ({ id, file, onRemove }: { id: string; file: File; onR
   };
 
   return (
-    <div ref={setNodeRef} style={style} className={styles.videoItem}>
-      <div {...attributes} {...listeners} className={styles.dragHandle}>
+    <div ref={setNodeRef} style={style} className={`${styles.videoItem} ${disabled ? styles.disabled : ''}`}>
+      <div {...(disabled ? {} : attributes)} {...(disabled ? {} : listeners)} className={styles.dragHandle}>
         <GripVertical size={20} />
       </div>
       <span className={styles.fileName}>{file.name}</span>
-      <button onClick={() => onRemove(id)} className={styles.removeBtn}>
-        <X size={20} />
-      </button>
+      {!disabled && (
+        <button onClick={() => onRemove(id)} className={styles.removeBtn}>
+          <X size={20} />
+        </button>
+      )}
     </div>
   );
 };
@@ -62,6 +65,7 @@ function App() {
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState('');
+  const [error, setError] = useState<string | null>(null);
   const [isDone, setIsDone] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -80,12 +84,13 @@ function App() {
       }));
       setVideos(prev => [...prev, ...newFiles]);
       setIsDone(false);
+      setError(null);
     }
   };
 
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
-    if (over && active.id !== over.id) {
+    if (over && active.id !== over.id && !processing) {
       setVideos((items) => {
         const oldIndex = items.findIndex((i) => i.id === active.id);
         const newIndex = items.findIndex((i) => i.id === over.id);
@@ -95,30 +100,43 @@ function App() {
   };
 
   const removeVideo = (id: string) => {
+    if (processing) return;
     setVideos(prev => prev.filter(v => v.id !== id));
     setIsDone(false);
+    setError(null);
   };
 
   const concatenate = async () => {
     if (videos.length < 2) return;
     setProcessing(true);
     setIsDone(false);
+    setError(null);
     setProgress(0);
+
+    let encoder: VideoEncoder | null = null;
+    const demuxer = new WebDemuxer({
+      wasmFilePath: `${window.location.origin}/wasm-files/web-demuxer.wasm`
+    });
 
     try {
       setStatus('Initializing...');
       
       // Get dimensions from first video to use as target resolution
-      const firstVideo = document.createElement('video');
-      const firstVideoUrl = URL.createObjectURL(videos[0].file);
-      firstVideo.src = firstVideoUrl;
-      await new Promise((resolve, reject) => {
-        firstVideo.onloadedmetadata = resolve;
-        firstVideo.onerror = reject;
-      });
-      const targetWidth = firstVideo.videoWidth;
-      const targetHeight = firstVideo.videoHeight;
-      URL.revokeObjectURL(firstVideoUrl);
+      await demuxer.load(videos[0].file);
+      const mediaInfo = await demuxer.getMediaInfo();
+      const videoStream = mediaInfo.streams.find(s => s.codec_type_string === 'video');
+      
+      if (!videoStream) {
+        throw new Error('No video stream found in the first video.');
+      }
+
+      // H.264 requires even dimensions
+      const targetWidth = videoStream.width & ~1;
+      const targetHeight = videoStream.height & ~1;
+
+      if (targetWidth === 0 || targetHeight === 0) {
+        throw new Error('Invalid video dimensions detected.');
+      }
 
       const muxer = new Muxer({
         target: new ArrayBufferTarget(),
@@ -130,82 +148,85 @@ function App() {
         fastStart: 'in-memory'
       });
 
-      const encoder = new VideoEncoder({
+      encoder = new VideoEncoder({
         output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
         error: (e) => {
           console.error('VideoEncoder error:', e);
-          setStatus('Encoder error: ' + e.message);
+          setError('Encoder error: ' + e.message);
         }
       });
 
+      // avc1.4d002a = Main Profile, Level 4.2 (supports 1080p @ 60fps)
       const config: VideoEncoderConfig = {
-        codec: 'avc1.42E01E', // Baseline profile for maximum compatibility
+        codec: 'avc1.4d002a',
         width: targetWidth,
         height: targetHeight,
-        bitrate: 5_000_000, // 5 Mbps
+        bitrate: 5_000_000, 
         framerate: 30,
       };
 
       const support = await VideoEncoder.isConfigSupported(config);
       if (!support.supported) {
-        throw new Error('Video configuration not supported by this browser.');
+        throw new Error(`Video configuration not supported by this browser: ${targetWidth}x${targetHeight}`);
       }
 
       encoder.configure(config);
 
-      let accumulatedTime = 0;
-      const fps = 30;
-      const interval = 1 / fps;
+      let accumulatedTimeMicros = 0;
+      const canvas = new OffscreenCanvas(targetWidth, targetHeight);
+      const ctx = canvas.getContext('2d', { alpha: false })!;
 
       for (let i = 0; i < videos.length; i++) {
         const videoFile = videos[i].file;
-        const url = URL.createObjectURL(videoFile);
-        const video = document.createElement('video');
-        video.src = url;
-        video.muted = true;
-        video.playsInline = true;
+        await demuxer.load(videoFile);
+        const currentMediaInfo = await demuxer.getMediaInfo();
+        const videoDuration = currentMediaInfo.duration;
+        const decoderConfig = await demuxer.getDecoderConfig('video');
         
-        await new Promise((resolve, reject) => {
-          video.onloadedmetadata = resolve;
-          video.onerror = reject;
+        let frameCount = 0;
+        const decoder = new VideoDecoder({
+          output: (frame) => {
+            ctx.drawImage(frame, 0, 0, targetWidth, targetHeight);
+            const timestampMicros = frame.timestamp + accumulatedTimeMicros;
+            
+            const newFrame = new VideoFrame(canvas, {
+              timestamp: timestampMicros,
+              duration: frame.duration || undefined
+            });
+            
+            encoder!.encode(newFrame, { keyFrame: frameCount % 60 === 0 });
+            newFrame.close();
+            frame.close();
+            frameCount++;
+          },
+          error: (e) => {
+            console.error('VideoDecoder error:', e);
+            setError('Decoder error: ' + e.message);
+          }
         });
-        
-        const duration = video.duration;
-        let currentTime = 0;
-        
-        const canvas = new OffscreenCanvas(targetWidth, targetHeight);
-        const ctx = canvas.getContext('2d', { alpha: false })!;
 
-        while (currentTime < duration) {
-          video.currentTime = currentTime;
-          await new Promise((resolve) => {
-            video.onseeked = resolve;
-          });
+        decoder.configure(decoderConfig);
+
+        const stream = demuxer.read('video');
+        const reader = stream.getReader();
+        
+        while (true) {
+          const { done, value: chunk } = await reader.read();
+          if (done) break;
           
-          ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
-          
-          const timestampMicros = Math.round(accumulatedTime * 1_000_000);
-          const durationMicros = Math.round(interval * 1_000_000);
-          
-          const frame = new VideoFrame(canvas, {
-            timestamp: timestampMicros,
-            duration: durationMicros
-          });
-          
-          encoder.encode(frame, { keyFrame: Math.floor(currentTime * fps) % 60 === 0 });
-          frame.close();
-          
-          currentTime += interval;
-          accumulatedTime += interval;
-          
+          decoder.decode(chunk);
+
           // Update progress
-          const currentVideoProgress = currentTime / duration;
+          const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
           const totalProgress = ((i + currentVideoProgress) / videos.length) * 90;
           setProgress(Math.round(totalProgress));
           setStatus(`Stitching video ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
         }
+
+        await decoder.flush();
+        decoder.close();
         
-        URL.revokeObjectURL(url);
+        accumulatedTimeMicros += Math.round(videoDuration * 1_000_000);
       }
 
       setStatus('Finalizing video...');
@@ -224,12 +245,15 @@ function App() {
       setProgress(100);
       setIsDone(true);
       setStatus('Finished!');
-    } catch (error) {
-      console.error(error);
-      const errorMessage = error instanceof Error ? error.message : 'Error processing videos.';
-      setStatus(errorMessage);
+    } catch (err) {
+      console.error(err);
+      setError(err instanceof Error ? err.message : 'An unexpected error occurred during stitching.');
     } finally {
       setProcessing(false);
+      demuxer.destroy();
+      if (encoder && encoder.state !== 'closed') {
+        encoder.close();
+      }
     }
   };
 
@@ -267,10 +291,23 @@ function App() {
         <p>Combine videos in your browser. Fast, private, and free.</p>
       </div>
 
+      {error && (
+        <div className={styles.errorBanner}>
+          <AlertTriangle size={20} />
+          <span>{error}</span>
+          <button onClick={() => setError(null)} className={styles.closeError}>
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
       {!processing && !isDone && (
-        <div className={styles.dropzone} onClick={() => fileInputRef.current?.click()}>
-          <Upload size={48} color="#2563eb" style={{ marginBottom: '1rem' }} />
-          <p>Tap to add videos</p>
+        <div 
+          className={`${styles.dropzone} ${videos.length > 0 ? styles.dropzoneSmall : ''}`} 
+          onClick={() => fileInputRef.current?.click()}
+        >
+          <Upload size={videos.length > 0 ? 32 : 48} color="#2563eb" style={{ marginBottom: '0.5rem' }} />
+          <p>{videos.length > 0 ? 'Add more videos' : 'Tap to add videos'}</p>
           <input
             type="file"
             multiple
@@ -309,6 +346,7 @@ function App() {
                 id={video.id}
                 file={video.file}
                 onRemove={removeVideo}
+                disabled={processing}
               />
             ))}
           </div>

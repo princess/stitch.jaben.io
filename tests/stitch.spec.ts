@@ -32,8 +32,16 @@ test('should stitch two videos together', async ({ page }) => {
   // Wait for processing to start
   await expect(page.locator('text=Processing...')).toBeVisible();
 
-  // Wait for success message (increased timeout because encoding can take a few seconds)
-  await expect(page.locator('text=Successfully Stitched!')).toBeVisible({ timeout: 60000 });
+  // Verify that remove buttons are hidden during processing
+  await expect(page.locator('button[class*="removeBtn"]')).toHaveCount(0);
+
+  // Wait for success message or error banner
+  await Promise.race([
+    expect(page.locator('text=Successfully Stitched!')).toBeVisible({ timeout: 120000 }),
+    expect(page.locator('div[class*="errorBanner"]')).toBeVisible({ timeout: 120000 }).then(() => {
+      throw new Error('Stitching failed with error banner');
+    })
+  ]);
 
   // Verify that the "Start New Project" button is visible
   await expect(page.locator('text=Start New Project')).toBeVisible();
