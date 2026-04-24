@@ -18,7 +18,7 @@
 -   **Drag & Drop**: [@dnd-kit](https://dndkit.com/)
 -   **Icons**: [Lucide React](https://lucide.dev/)
 -   **Styling**: Vanilla CSS (CSS Modules)
--   **Deployment**: [gh-pages](https://www.npmjs.com/package/gh-pages)
+-   **Deployment**: GitHub Pages (via GitHub Actions)
 
 ## 🏗️ Architecture & Technical Challenges
 
@@ -32,8 +32,8 @@ Since GitHub Pages doesn't allow custom HTTP headers, this project uses `coi-ser
 
 1.  **Clone the repository**:
     ```bash
-    git clone <your-repo-url>
-    cd videoattachthingy
+    git clone https://github.com/jaben/stitch.jaben.io.git
+    cd stitch.jaben.io
     ```
 
 2.  **Install dependencies**:
@@ -53,17 +53,13 @@ Since GitHub Pages doesn't allow custom HTTP headers, this project uses `coi-ser
 
 ## 🚀 Deployment
 
-### Manual Deployment
-1. Update the `homepage` field in `package.json` if using a custom domain or subpath.
-2. Run the deploy script:
-    ```bash
-    npm run deploy
-    ```
-
 ### Automated Deployment (CI/CD)
-This project includes a GitHub Action (`.github/workflows/deploy.yml`) that automatically builds and deploys the site to the `gh-pages` branch whenever you push to the `main` branch. 
+This project includes a GitHub Action (`.github/workflows/deploy.yml`) that automatically builds and deploys the site to GitHub Pages whenever you push to the `main` branch.
 
-*Note: Ensure that GitHub Actions has "Read and write permissions" in your repository's Settings > Actions > General.*
+### Manual Deployment
+If you prefer to deploy manually:
+1. Update the `homepage` field in `package.json`.
+2. Run: `npm run deploy`
 
 ## 📄 License
 
