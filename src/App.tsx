@@ -1,6 +1,5 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import React, { useState, useRef } from 'react';
+import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import {
   DndContext,
   closestCenter,
@@ -18,7 +17,7 @@ import {
   useSortable,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVertical, X, Play, Loader2, Upload, CheckCircle2 } from 'lucide-react';
+import { GripVertical, X, Play, Loader2, Upload, CheckCircle2, AlertTriangle } from 'lucide-react';
 import styles from './App.module.css';
 
 interface VideoFile {
@@ -54,13 +53,16 @@ const SortableVideoItem = ({ id, file, onRemove }: { id: string; file: File; onR
 };
 
 function App() {
-  const [loaded, setLoaded] = useState(false);
+  const [browserSupported] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    return !!(window.VideoEncoder && window.VideoFrame && window.OffscreenCanvas);
+  });
+  const [loaded] = useState(true);
   const [videos, setVideos] = useState<VideoFile[]>([]);
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState('');
   const [isDone, setIsDone] = useState(false);
-  const ffmpegRef = useRef(new FFmpeg());
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const sensors = useSensors(
@@ -69,28 +71,6 @@ function App() {
       coordinateGetter: sortableKeyboardCoordinates,
     })
   );
-
-  useEffect(() => {
-    load();
-  }, []);
-
-  const load = async () => {
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-    const ffmpeg = ffmpegRef.current;
-    
-    ffmpeg.on('progress', ({ progress: ffmpegProgress }) => {
-      // FFmpeg conversion stage: 15% to 90%
-      const mapped = 15 + Math.floor(ffmpegProgress * 75);
-      // Ensure we don't go backwards if ffmpeg emits late events
-      setProgress(prev => Math.max(prev, mapped));
-    });
-
-    await ffmpeg.load({
-      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-    });
-    setLoaded(true);
-  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
@@ -124,60 +104,130 @@ function App() {
     setProcessing(true);
     setIsDone(false);
     setProgress(0);
-    const ffmpeg = ffmpegRef.current;
 
     try {
-      setStatus('Reading files...');
-      setProgress(2);
-      const fileNames: string[] = [];
+      setStatus('Initializing...');
       
-      for (let i = 0; i < videos.length; i++) {
-        const fileName = `input${i}.mp4`;
-        fileNames.push(fileName);
-        await ffmpeg.writeFile(fileName, await fetchFile(videos[i].file));
-        // Files loading: 2% to 15%
-        setProgress(Math.round(2 + ((i + 1) / videos.length) * 13));
+      // Get dimensions from first video to use as target resolution
+      const firstVideo = document.createElement('video');
+      const firstVideoUrl = URL.createObjectURL(videos[0].file);
+      firstVideo.src = firstVideoUrl;
+      await new Promise((resolve, reject) => {
+        firstVideo.onloadedmetadata = resolve;
+        firstVideo.onerror = reject;
+      });
+      const targetWidth = firstVideo.videoWidth;
+      const targetHeight = firstVideo.videoHeight;
+      URL.revokeObjectURL(firstVideoUrl);
+
+      const muxer = new Muxer({
+        target: new ArrayBufferTarget(),
+        video: {
+          codec: 'avc',
+          width: targetWidth,
+          height: targetHeight
+        },
+        fastStart: 'in-memory'
+      });
+
+      const encoder = new VideoEncoder({
+        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+        error: (e) => {
+          console.error('VideoEncoder error:', e);
+          setStatus('Encoder error: ' + e.message);
+        }
+      });
+
+      const config: VideoEncoderConfig = {
+        codec: 'avc1.42E01E', // Baseline profile for maximum compatibility
+        width: targetWidth,
+        height: targetHeight,
+        bitrate: 5_000_000, // 5 Mbps
+        framerate: 30,
+      };
+
+      const support = await VideoEncoder.isConfigSupported(config);
+      if (!support.supported) {
+        throw new Error('Video configuration not supported by this browser.');
       }
 
-      setStatus('Stitching clips...');
-      const concatContent = fileNames.map(name => `file '${name}'`).join('\n');
-      await ffmpeg.writeFile('concat.txt', concatContent);
+      encoder.configure(config);
 
-      await ffmpeg.exec([
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', 'concat.txt',
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
-        'output.mp4'
-      ]);
+      let accumulatedTime = 0;
+      const fps = 30;
+      const interval = 1 / fps;
 
-      setStatus('Generating video file...');
-      setProgress(92);
-      const data = await ffmpeg.readFile('output.mp4');
-      setProgress(98);
+      for (let i = 0; i < videos.length; i++) {
+        const videoFile = videos[i].file;
+        const url = URL.createObjectURL(videoFile);
+        const video = document.createElement('video');
+        video.src = url;
+        video.muted = true;
+        video.playsInline = true;
+        
+        await new Promise((resolve, reject) => {
+          video.onloadedmetadata = resolve;
+          video.onerror = reject;
+        });
+        
+        const duration = video.duration;
+        let currentTime = 0;
+        
+        const canvas = new OffscreenCanvas(targetWidth, targetHeight);
+        const ctx = canvas.getContext('2d', { alpha: false })!;
+
+        while (currentTime < duration) {
+          video.currentTime = currentTime;
+          await new Promise((resolve) => {
+            video.onseeked = resolve;
+          });
+          
+          ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+          
+          const timestampMicros = Math.round(accumulatedTime * 1_000_000);
+          const durationMicros = Math.round(interval * 1_000_000);
+          
+          const frame = new VideoFrame(canvas, {
+            timestamp: timestampMicros,
+            duration: durationMicros
+          });
+          
+          encoder.encode(frame, { keyFrame: Math.floor(currentTime * fps) % 60 === 0 });
+          frame.close();
+          
+          currentTime += interval;
+          accumulatedTime += interval;
+          
+          // Update progress
+          const currentVideoProgress = currentTime / duration;
+          const totalProgress = ((i + currentVideoProgress) / videos.length) * 90;
+          setProgress(Math.round(totalProgress));
+          setStatus(`Stitching video ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
+        }
+        
+        URL.revokeObjectURL(url);
+      }
+
+      setStatus('Finalizing video...');
+      setProgress(95);
+      await encoder.flush();
+      muxer.finalize();
       
-      setStatus('Finished!');
-      const url = URL.createObjectURL(new Blob([data as any], { type: 'video/mp4' }));
+      const { buffer } = muxer.target as ArrayBufferTarget;
+      const blob = new Blob([buffer], { type: 'video/mp4' });
+      const downloadUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url;
+      a.href = downloadUrl;
       a.download = 'stitched_video.mp4';
       a.click();
       
-      // Cleanup
-      for (const name of fileNames) {
-        await ffmpeg.deleteFile(name);
-      }
-      await ffmpeg.deleteFile('concat.txt');
-      await ffmpeg.deleteFile('output.mp4');
-
       setProgress(100);
       setIsDone(true);
+      setStatus('Finished!');
     } catch (error) {
       console.error(error);
-      setStatus('Error processing videos.');
+      const errorMessage = error instanceof Error ? error.message : 'Error processing videos.';
+      setStatus(errorMessage);
     } finally {
       setProcessing(false);
     }
@@ -190,6 +240,21 @@ function App() {
           <h1>Stitch</h1>
           <p>Initializing engine...</p>
           <Loader2 className={styles.spinner} size={48} />
+        </div>
+      </div>
+    );
+  }
+
+  if (!browserSupported) {
+    return (
+      <div className={styles.container}>
+        <div className={styles.header}>
+          <h1>Stitch</h1>
+          <div className={styles.successCard} style={{ borderColor: '#ef4444' }}>
+            <AlertTriangle size={48} color="#ef4444" />
+            <h2>Browser Not Supported</h2>
+            <p>Your browser doesn't support WebCodecs. Please use a modern version of Chrome, Edge, or Opera.</p>
+          </div>
         </div>
       </div>
     );
