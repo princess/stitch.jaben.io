@@ -18,7 +18,7 @@ import {
   useSortable,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVertical, X, Play, Loader2, Upload } from 'lucide-react';
+import { GripVertical, X, Play, Loader2, Upload, CheckCircle2 } from 'lucide-react';
 import styles from './App.module.css';
 
 interface VideoFile {
@@ -59,6 +59,7 @@ function App() {
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState('');
+  const [isDone, setIsDone] = useState(false);
   const ffmpegRef = useRef(new FFmpeg());
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -76,15 +77,14 @@ function App() {
   const load = async () => {
     const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
     const ffmpeg = ffmpegRef.current;
-    ffmpeg.on('log', ({ message }) => {
-      console.log(message);
-    });
-    // The default progress event is only for the ffmpeg.exec() part
+    
     ffmpeg.on('progress', ({ progress }) => {
-      // Map 0-1 to 10-90 range to account for prep and finalization
-      const mappedProgress = 10 + Math.round(progress * 80);
+      // ffmpeg.exec() progress is 0 to 1.
+      // We map this to 15% - 90% of our total progress bar.
+      const mappedProgress = 15 + Math.round(progress * 75);
       setProgress(mappedProgress);
     });
+
     await ffmpeg.load({
       coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
       wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
@@ -99,6 +99,7 @@ function App() {
         file
       }));
       setVideos(prev => [...prev, ...newFiles]);
+      setIsDone(false);
     }
   };
 
@@ -115,27 +116,30 @@ function App() {
 
   const removeVideo = (id: string) => {
     setVideos(prev => prev.filter(v => v.id !== id));
+    setIsDone(false);
   };
 
   const concatenate = async () => {
     if (videos.length < 2) return;
     setProcessing(true);
+    setIsDone(false);
     setProgress(0);
     const ffmpeg = ffmpegRef.current;
 
     try {
-      setStatus('Preparing files...');
-      setProgress(2);
+      setStatus('Preparing videos...');
+      setProgress(5);
       const fileNames: string[] = [];
       
       for (let i = 0; i < videos.length; i++) {
         const fileName = `input${i}.mp4`;
         fileNames.push(fileName);
         await ffmpeg.writeFile(fileName, await fetchFile(videos[i].file));
-        setProgress(Math.round(2 + ((i + 1) / videos.length) * 8)); // Up to 10%
+        // Files are loaded up to 15%
+        setProgress(Math.round(5 + ((i + 1) / videos.length) * 10));
       }
 
-      setStatus('Concatenating...');
+      setStatus('Stitching clips together...');
       // Create concat.txt
       const concatContent = fileNames.map(name => `file '${name}'`).join('\n');
       await ffmpeg.writeFile('concat.txt', concatContent);
@@ -146,18 +150,19 @@ function App() {
         '-i', 'concat.txt',
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
+        '-pix_fmt', 'yuv420p', // Critical for iOS/Mobile compatibility
         '-c:a', 'aac',
         'output.mp4'
       ]);
 
-      setStatus('Finalizing...');
+      setStatus('Generating download...');
       setProgress(95);
       const data = await ffmpeg.readFile('output.mp4');
       const url = URL.createObjectURL(new Blob([data as any], { type: 'video/mp4' }));
       
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'concatenated_video.mp4';
+      a.download = 'stitched_video.mp4';
       a.click();
       
       // Cleanup
@@ -168,14 +173,13 @@ function App() {
       await ffmpeg.deleteFile('output.mp4');
 
       setProgress(100);
-      setStatus('Done!');
+      setStatus('Success!');
+      setIsDone(true);
     } catch (error) {
       console.error(error);
-      setStatus('Error occurred during processing.');
+      setStatus('Error: Could not process videos.');
     } finally {
-      setTimeout(() => {
-        setProcessing(false);
-      }, 2000);
+      setProcessing(false);
     }
   };
 
@@ -184,7 +188,7 @@ function App() {
       <div className={styles.container}>
         <div className={styles.header}>
           <h1>Stitch</h1>
-          <p>Loading video processing engine...</p>
+          <p>Waking up the engine...</p>
           <Loader2 className={styles.spinner} size={48} />
         </div>
       </div>
@@ -195,21 +199,34 @@ function App() {
     <div className={styles.container}>
       <div className={styles.header}>
         <h1>Stitch</h1>
-        <p>Concatenate your videos in the browser. Safe, private, and free.</p>
+        <p>Combine videos directly in your browser. Private & Secure.</p>
       </div>
 
-      <div className={styles.dropzone} onClick={() => fileInputRef.current?.click()}>
-        <Upload size={48} color="#2563eb" style={{ marginBottom: '1rem' }} />
-        <p>Click or drag videos here to add</p>
-        <input
-          type="file"
-          multiple
-          accept="video/*"
-          ref={fileInputRef}
-          onChange={handleFileChange}
-          style={{ display: 'none' }}
-        />
-      </div>
+      {!processing && !isDone && (
+        <div className={styles.dropzone} onClick={() => fileInputRef.current?.click()}>
+          <Upload size={48} color="#2563eb" style={{ marginBottom: '1rem' }} />
+          <p>Tap or drag videos to add</p>
+          <input
+            type="file"
+            multiple
+            accept="video/*"
+            ref={fileInputRef}
+            onChange={handleFileChange}
+            style={{ display: 'none' }}
+          />
+        </div>
+      )}
+
+      {isDone && !processing && (
+        <div className={styles.successCard}>
+          <CheckCircle2 size={48} color="#10b981" />
+          <h2>Done!</h2>
+          <p>Your video has been stitched and downloaded.</p>
+          <button onClick={() => setIsDone(false)} className={styles.secondaryBtn}>
+            Stitch More
+          </button>
+        </div>
+      )}
 
       <DndContext
         sensors={sensors}
@@ -233,7 +250,7 @@ function App() {
         </SortableContext>
       </DndContext>
 
-      {videos.length > 0 && (
+      {videos.length > 0 && !isDone && (
         <div className={styles.controls}>
           <button
             onClick={concatenate}
@@ -242,23 +259,23 @@ function App() {
           >
             {processing ? (
               <>
-                <Loader2 className={styles.spinner} size={20} />
+                <Loader2 className={styles.spinnerSmall} size={20} />
                 Processing...
               </>
             ) : (
               <>
                 <Play size={20} />
-                Concatenate {videos.length} Videos
+                Stitch {videos.length} Videos
               </>
             )}
           </button>
 
           {processing && (
-            <div style={{ width: '100%' }}>
+            <div className={styles.progressContainer}>
               <div className={styles.progressBar}>
                 <div className={styles.progressFill} style={{ width: `${progress}%` }} />
               </div>
-              <p className={styles.status}>{status} ({progress}%)</p>
+              <p className={styles.status}>{status} {progress}%</p>
             </div>
           )}
         </div>
