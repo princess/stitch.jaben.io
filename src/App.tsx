@@ -186,7 +186,31 @@ function App() {
         let frameCount = 0;
         const decoder = new VideoDecoder({
           output: (frame) => {
-            ctx.drawImage(frame, 0, 0, targetWidth, targetHeight);
+            // Clear to black for pillarboxing/letterboxing
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, targetWidth, targetHeight);
+
+            const videoWidth = frame.displayWidth;
+            const videoHeight = frame.displayHeight;
+            const videoAspectRatio = videoWidth / videoHeight;
+            const targetAspectRatio = targetWidth / targetHeight;
+
+            let drawWidth = targetWidth;
+            let drawHeight = targetHeight;
+            let offsetX = 0;
+            let offsetY = 0;
+
+            if (videoAspectRatio > targetAspectRatio) {
+              // Video is wider than target: letterbox
+              drawHeight = targetWidth / videoAspectRatio;
+              offsetY = (targetHeight - drawHeight) / 2;
+            } else {
+              // Video is taller than target: pillarbox
+              drawWidth = targetHeight * videoAspectRatio;
+              offsetX = (targetWidth - drawWidth) / 2;
+            }
+
+            ctx.drawImage(frame, offsetX, offsetY, drawWidth, drawHeight);
             const timestampMicros = frame.timestamp + accumulatedTimeMicros;
             
             const newFrame = new VideoFrame(canvas, {
