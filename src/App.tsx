@@ -25,8 +25,8 @@ import styles from './App.module.css';
 const areBuffersEqual = (a: AllowSharedBufferSource | undefined, b: AllowSharedBufferSource | undefined) => {
   if (a === b) return true;
   if (!a || !b) return false;
-  const viewA = new Uint8Array(a instanceof ArrayBuffer ? a : a.buffer, (a as any).byteOffset || 0, a.byteLength);
-  const viewB = new Uint8Array(b instanceof ArrayBuffer ? b : b.buffer, (b as any).byteOffset || 0, b.byteLength);
+  const viewA = new Uint8Array(a instanceof ArrayBuffer || a instanceof SharedArrayBuffer ? a : a.buffer);
+  const viewB = new Uint8Array(b instanceof ArrayBuffer || b instanceof SharedArrayBuffer ? b : b.buffer);
   if (viewA.length !== viewB.length) return false;
   for (let i = 0; i < viewA.length; i++) {
     if (viewA[i] !== viewB[i]) return false;
@@ -140,7 +140,7 @@ function App() {
       const targetWidth = targetConfig.codedWidth;
       const targetHeight = targetConfig.codedHeight;
       const targetCodec = targetConfig.codec;
-      const targetDescription = targetConfig.description ? new Uint8Array(targetConfig.description).slice().buffer : undefined;
+      const targetDescription = targetConfig.description ? new Uint8Array(targetConfig.description as ArrayBuffer).slice().buffer : undefined;
 
       if (!targetWidth || !targetHeight) {
         throw new Error('Invalid video dimensions detected.');
