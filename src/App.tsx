@@ -1,6 +1,11 @@
 import React, { useState, useRef } from 'react';
 import { Muxer, ArrayBufferTarget, type MuxerOptions } from 'mp4-muxer';
 import { WebDemuxer } from 'web-demuxer';
+
+if (typeof window !== 'undefined') {
+  (window as any).WebDemuxer = WebDemuxer;
+}
+
 import {
   DndContext,
   closestCenter,
@@ -18,7 +23,7 @@ import {
   useSortable,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVertical, X, Play, Loader2, Upload, CheckCircle2, AlertTriangle } from 'lucide-react';
+import { GripVertical, X, Play, Loader2, Upload, CheckCircle2, AlertTriangle, Trash2 } from 'lucide-react';
 import styles from './App.module.css';
 
 // Helper to compare extradata/description buffers
@@ -121,6 +126,13 @@ function App() {
     setError(null);
   };
 
+  const clearVideos = () => {
+    if (processing) return;
+    setVideos([]);
+    setIsDone(false);
+    setError(null);
+  };
+
   const concatenate = async () => {
     if (videos.length < 2) return;
     setProcessing(true);
@@ -128,33 +140,46 @@ function App() {
     setError(null);
     setProgress(0);
 
+    console.log('--- STITCH ENGINE STARTING ---');
     let encoder: VideoEncoder | null = null;
-    let decoder: VideoDecoder | null = null;
-    const demuxer = new WebDemuxer({
-      wasmFilePath: `${window.location.origin}/wasm-files/web-demuxer.wasm`
-    });
+    let muxer: Muxer<ArrayBufferTarget> | null = null;
 
     try {
-      setStatus('Initializing...');
+      setStatus('Initializing Engine...');
+      console.log('[Init] Loading first video to determine target resolution...');
       
-      // Get dimensions from first video to use as target resolution
-      await demuxer.load(videos[0].file);
-      const targetConfig = await demuxer.getDecoderConfig('video');
-      const targetWidth = targetConfig.codedWidth;
-      const targetHeight = targetConfig.codedHeight;
-      const targetCodec = targetConfig.codec;
-      const targetDescription = targetConfig.description ? new Uint8Array(targetConfig.description as ArrayBuffer).slice().buffer : undefined;
-
-      if (!targetWidth || !targetHeight) {
-        throw new Error('Invalid video dimensions detected.');
-      }
-
-      // Check for audio
+      const initialDemuxer = new WebDemuxer({
+        wasmFilePath: `${window.location.origin}/wasm-files/web-demuxer.wasm`
+      });
+      
+      let targetWidth: number;
+      let targetHeight: number;
+      let targetCodec: string;
+      let targetDescription: ArrayBuffer | undefined;
       let targetAudioConfig: AudioDecoderConfig | null = null;
+
       try {
-        targetAudioConfig = await demuxer.getDecoderConfig('audio');
-      } catch {
-        // No audio track
+        await initialDemuxer.load(videos[0].file);
+        const targetConfig = await initialDemuxer.getDecoderConfig('video');
+        targetWidth = targetConfig.codedWidth!;
+        targetHeight = targetConfig.codedHeight!;
+        targetCodec = targetConfig.codec;
+        targetDescription = targetConfig.description ? new Uint8Array(targetConfig.description as ArrayBuffer).slice().buffer : undefined;
+
+        console.log(`[Init] Target Resolution: ${targetWidth}x${targetHeight}, Codec: ${targetCodec}`);
+
+        if (!targetWidth || !targetHeight) {
+          throw new Error('Invalid video dimensions detected.');
+        }
+
+        try {
+          targetAudioConfig = await initialDemuxer.getDecoderConfig('audio');
+          console.log(`[Init] Audio Detected: ${targetAudioConfig.codec}`);
+        } catch {
+          console.log('[Init] No audio track detected in first video.');
+        }
+      } finally {
+        await initialDemuxer.destroy();
       }
 
       const isHevc = targetCodec.startsWith('hev') || targetCodec.startsWith('hvc');
@@ -178,31 +203,28 @@ function App() {
         };
       }
 
-      const muxer = new Muxer(muxerConfig);
+      muxer = new Muxer(muxerConfig);
 
       encoder = new VideoEncoder({
-        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+        output: (chunk, meta) => muxer!.addVideoChunk(chunk, meta),
         error: (e) => {
-          console.error('VideoEncoder error:', e);
+          console.error('[Encoder] CRITICAL ERROR:', e);
           setError('Encoder error: ' + e.message);
         }
       });
 
-      // avc1.4d002a = Main Profile, Level 4.2 (supports 1080p @ 60fps)
-      // hev1.1.6.L120.90 = Main Profile, Level 4.0 (for HEVC)
       const encoderCodec = isHevc ? 'hev1.1.6.L120.90' : 'avc1.4d002a';
-
       const baseEncoderConfig: VideoEncoderConfig = {
         codec: encoderCodec,
         width: targetWidth,
         height: targetHeight,
-        bitrate: 4_000_000, // Reduced from 5Mbps for better mobile performance/speed
+        bitrate: 4_000_000,
         framerate: 30,
       };
       
       const optimizedEncoderConfig: VideoEncoderConfig = {
         ...baseEncoderConfig,
-        latencyMode: 'realtime', // Keep low latency for faster pipeline flow
+        latencyMode: 'realtime',
         hardwareAcceleration: 'prefer-hardware',
       };
 
@@ -210,12 +232,9 @@ function App() {
       if (support.supported) {
         encoder.configure(optimizedEncoderConfig);
       } else {
-        const baseSupport = await VideoEncoder.isConfigSupported(baseEncoderConfig);
-        if (!baseSupport.supported) {
-          throw new Error(`Video configuration not supported by this browser: ${targetWidth}x${targetHeight}`);
-        }
         encoder.configure(baseEncoderConfig);
       }
+      console.log('[Init] Encoder configured.');
 
       let accumulatedTimeMicros = 0;
       let lastDts = -1;
@@ -223,260 +242,211 @@ function App() {
       const canvas = new OffscreenCanvas(targetWidth, targetHeight);
       const ctx = canvas.getContext('2d', { alpha: false });
       
-      if (!ctx) {
-        throw new Error('Failed to initialize 2D context for transcoding.');
-      }
-
-      // Shared context for VideoDecoder callback
-      const clipContext = {
-        pendingFrames: [] as Promise<void>[],
-        clipVideoOffset: null as number | null,
-        clipMaxTime: 0,
-        frameCount: 0,
-      };
-
-      decoder = new VideoDecoder({
-        output: (frame) => {
-          const frameTask = (async (f: VideoFrame) => {
-            try {
-              if (clipContext.clipVideoOffset === null) clipContext.clipVideoOffset = f.timestamp;
-              const timestampMicros = (f.timestamp - clipContext.clipVideoOffset) + accumulatedTimeMicros;
-              
-              let frameToEncode: VideoFrame;
-              clipContext.clipMaxTime = Math.max(clipContext.clipMaxTime, timestampMicros - accumulatedTimeMicros + (f.duration ?? 0));
-
-              if (f.displayWidth === targetWidth && f.displayHeight === targetHeight) {
-                // Optimization: If dimensions match exactly, we can skip drawImage
-                frameToEncode = new VideoFrame(f, {
-                  timestamp: timestampMicros,
-                  duration: f.duration || undefined
-                });
-              } else {
-                // Clear to black for pillarboxing/letterboxing
-                ctx.fillStyle = 'black';
-                ctx.fillRect(0, 0, targetWidth, targetHeight);
-
-                const videoWidth = f.displayWidth;
-                const videoHeight = f.displayHeight;
-                const videoAspectRatio = videoWidth / videoHeight;
-                const targetAspectRatio = targetWidth / targetHeight;
-
-                let drawWidth = targetWidth;
-                let drawHeight = targetHeight;
-                let offsetX = 0;
-                let offsetY = 0;
-
-                if (videoAspectRatio > targetAspectRatio) {
-                  // Video is wider than target: letterbox
-                  drawHeight = targetWidth / videoAspectRatio;
-                  offsetY = (targetHeight - drawHeight) / 2;
-                } else {
-                  // Video is taller than target: pillarbox
-                  drawWidth = targetHeight * videoAspectRatio;
-                  offsetX = (targetWidth - drawWidth) / 2;
-                }
-
-                ctx.drawImage(f, offsetX, offsetY, drawWidth, drawHeight);
-                
-                frameToEncode = new VideoFrame(canvas, {
-                  timestamp: timestampMicros,
-                  duration: f.duration || undefined
-                });
-              }
-              
-              // Encoder Backpressure Handling (More conservative for mobile)
-              if (encoder!.encodeQueueSize > 10) {
-                await delay(20);
-              }
-
-              encoder!.encode(frameToEncode, { keyFrame: clipContext.frameCount % 120 === 0 });
-              frameToEncode.close();
-              clipContext.frameCount++;
-            } finally {
-              f.close();
-            }
-          })(frame);
-          clipContext.pendingFrames.push(frameTask);
-        },
-        error: (e) => {
-          console.error('VideoDecoder error:', e);
-          setError('Decoder error: ' + e.message);
-        }
-      });
+      if (!ctx) throw new Error('Failed to initialize 2D context.');
 
       for (let i = 0; i < videos.length; i++) {
         const videoFile = videos[i].file;
-        await demuxer.load(videoFile);
-        const currentMediaInfo = await demuxer.getMediaInfo();
-        const videoDuration = currentMediaInfo.duration;
-        const currentConfig = await demuxer.getDecoderConfig('video');
+        console.log(`[Clip ${i + 1}/${videos.length}] --- STARTING CLIP: ${videoFile.name} ---`);
         
-        let currentAudioConfig: AudioDecoderConfig | null = null;
+        const demuxer = new WebDemuxer({
+          wasmFilePath: `${window.location.origin}/wasm-files/web-demuxer.wasm`
+        });
+
         try {
-          currentAudioConfig = await demuxer.getDecoderConfig('audio');
-        } catch {
-          // No audio
-        }
+          setStatus(`Loading clip ${i + 1}/${videos.length}...`);
+          await demuxer.load(videoFile);
+          const currentMediaInfo = await demuxer.getMediaInfo();
+          const videoDuration = currentMediaInfo.duration;
+          const currentConfig = await demuxer.getDecoderConfig('video');
+          
+          console.log(`[Clip ${i + 1}] Duration: ${videoDuration}s, Config: ${currentConfig.codedWidth}x${currentConfig.codedHeight} ${currentConfig.codec}`);
 
-        let clipMaxTime = 0;
-        let clipVideoOffset: number | null = null;
-        let clipAudioOffset: number | null = null;
-        // Check compatibility
-        const isCompatible = !(window as any).forceSlowPath && 
-          currentConfig.codec === targetCodec &&
-          currentConfig.codedWidth === targetWidth &&
-          currentConfig.codedHeight === targetHeight &&
-          areBuffersEqual(currentConfig.description, targetDescription);
+          let currentAudioConfig: AudioDecoderConfig | null = null;
+          try {
+            currentAudioConfig = await demuxer.getDecoderConfig('audio');
+          } catch { /* No audio */ }
 
-        // Hardening: Explicitly reset canvas resolution to force GPU buffer flush between clips
-        // This can help prevent stalls on mobile hardware where buffer management is aggressive.
-        if (i > 0) {
-          setStatus(`Hardening hardware state (${i}/${videos.length})...`);
-          canvas.width = 0;
-          canvas.height = 0;
-          await delay(100); // Allow hardware to breathe and flush
-          canvas.width = targetWidth;
-          canvas.height = targetHeight;
-        }
+          const isCompatible = !(window as any).forceSlowPath && 
+            currentConfig.codec === targetCodec &&
+            currentConfig.codedWidth === targetWidth &&
+            currentConfig.codedHeight === targetHeight &&
+            areBuffersEqual(currentConfig.description, targetDescription);
 
-        // Remux audio if available and compatible
-        const remuxAudio = async () => {
-          if (
-            targetAudioConfig && 
-            currentAudioConfig && 
-            currentAudioConfig.codec === targetAudioConfig.codec &&
-            currentAudioConfig.sampleRate === targetAudioConfig.sampleRate &&
-            currentAudioConfig.numberOfChannels === targetAudioConfig.numberOfChannels
-          ) {
+          console.log(`[Clip ${i + 1}] Compatibility Check: ${isCompatible ? 'FAST PATH (Remux)' : 'SLOW PATH (Transcode)'}`);
+
+          if (i > 0) {
+            console.log(`[Clip ${i + 1}] Transitioning... Hardening hardware state.`);
+            canvas.width = 0;
+            canvas.height = 0;
+            await delay(50); 
+            canvas.width = targetWidth;
+            canvas.height = targetHeight;
+          }
+
+          let clipMaxTime = 0;
+          let clipVideoOffset: number | null = null;
+          let clipAudioOffset: number | null = null;
+
+          // Process Video
+          if (isCompatible) {
+            const stream = demuxer.read('video');
+            const reader = stream.getReader();
+            try {
+              while (true) {
+                const { done, value: chunk } = await reader.read();
+                if (done) break;
+                
+                if (clipVideoOffset === null) clipVideoOffset = chunk.timestamp;
+                let timestamp = (chunk.timestamp - clipVideoOffset) + accumulatedTimeMicros;
+                if (timestamp <= lastDts) timestamp = lastDts + 1;
+                lastDts = timestamp;
+
+                const data = new Uint8Array(chunk.byteLength);
+                chunk.copyTo(data);
+                muxer.addVideoChunk(new EncodedVideoChunk({
+                  type: chunk.type,
+                  timestamp,
+                  duration: chunk.duration ?? undefined,
+                  data
+                }), { decoderConfig: currentConfig });
+
+                clipMaxTime = Math.max(clipMaxTime, timestamp - accumulatedTimeMicros + (chunk.duration ?? 0));
+                
+                if (chunk.timestamp % 1_000_000 < 50_000) { // Log every ~1s of video
+                  const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
+                  setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}% (Fast)`);
+                }
+              }
+            } finally {
+              reader.releaseLock();
+              await stream.cancel();
+            }
+          } else {
+            const clipContext = {
+              pendingFrames: [] as Promise<void>[],
+              clipVideoOffset: null as number | null,
+              clipMaxTime: 0,
+              frameCount: 0,
+            };
+
+            const decoder = new VideoDecoder({
+              output: (frame) => {
+                const frameTask = (async (f: VideoFrame) => {
+                  try {
+                    if (clipContext.clipVideoOffset === null) clipContext.clipVideoOffset = f.timestamp;
+                    const timestampMicros = (f.timestamp - clipContext.clipVideoOffset) + accumulatedTimeMicros;
+                    
+                    let frameToEncode: VideoFrame;
+                    clipContext.clipMaxTime = Math.max(clipContext.clipMaxTime, timestampMicros - accumulatedTimeMicros + (f.duration ?? 0));
+
+                    if (f.displayWidth === targetWidth && f.displayHeight === targetHeight) {
+                      frameToEncode = new VideoFrame(f, { timestamp: timestampMicros, duration: f.duration || undefined });
+                    } else {
+                      ctx.fillStyle = 'black';
+                      ctx.fillRect(0, 0, targetWidth, targetHeight);
+                      const videoAspectRatio = f.displayWidth / f.displayHeight;
+                      const targetAspectRatio = targetWidth / targetHeight;
+                      let drawW = targetWidth, drawH = targetHeight, offX = 0, offY = 0;
+                      if (videoAspectRatio > targetAspectRatio) {
+                        drawH = targetWidth / videoAspectRatio;
+                        offY = (targetHeight - drawH) / 2;
+                      } else {
+                        drawW = targetHeight * videoAspectRatio;
+                        offX = (targetWidth - drawW) / 2;
+                      }
+                      ctx.drawImage(f, offX, offY, drawW, drawH);
+                      frameToEncode = new VideoFrame(canvas, { timestamp: timestampMicros, duration: f.duration || undefined });
+                    }
+                    
+                    if (encoder!.encodeQueueSize > 10) await delay(10);
+                    encoder!.encode(frameToEncode, { keyFrame: clipContext.frameCount % 120 === 0 });
+                    frameToEncode.close();
+                    clipContext.frameCount++;
+                  } finally {
+                    f.close();
+                  }
+                })(frame);
+                clipContext.pendingFrames.push(frameTask);
+              },
+              error: (e) => {
+                console.error(`[Decoder Clip ${i+1}] ERROR:`, e);
+                setError(`Decoder error: ${e.message}`);
+              }
+            });
+
+            decoder.configure(currentConfig);
+            const stream = demuxer.read('video');
+            const reader = stream.getReader();
+            try {
+              while (true) {
+                const { done, value: chunk } = await reader.read();
+                if (done) break;
+                if (decoder.decodeQueueSize > 8) await delay(10);
+                decoder.decode(chunk);
+
+                if (chunk.timestamp % 1_000_000 < 50_000) {
+                  const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
+                  setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
+                }
+              }
+            } finally {
+              reader.releaseLock();
+              await stream.cancel();
+            }
+
+            console.log(`[Clip ${i + 1}] Finalizing decodes...`);
+            await decoder.flush();
+            await Promise.all(clipContext.pendingFrames);
+            clipMaxTime = clipContext.clipMaxTime;
+            decoder.close();
+          }
+
+          // Process Audio
+          if (targetAudioConfig && currentAudioConfig && 
+              currentAudioConfig.codec === targetAudioConfig.codec &&
+              currentAudioConfig.sampleRate === targetAudioConfig.sampleRate &&
+              currentAudioConfig.numberOfChannels === targetAudioConfig.numberOfChannels) {
+            console.log(`[Clip ${i + 1}] Audio compatible. Remuxing...`);
             const audioStream = demuxer.read('audio');
             const audioReader = audioStream.getReader();
             try {
               while (true) {
                 const { done, value: chunk } = await audioReader.read();
                 if (done) break;
-
                 if (clipAudioOffset === null) clipAudioOffset = chunk.timestamp;
                 let timestamp = (chunk.timestamp - clipAudioOffset) + accumulatedTimeMicros;
-                
-                if (timestamp <= lastAudioDts) {
-                  timestamp = lastAudioDts + 1;
-                }
+                if (timestamp <= lastAudioDts) timestamp = lastAudioDts + 1;
                 lastAudioDts = timestamp;
-
                 const data = new Uint8Array(chunk.byteLength);
                 chunk.copyTo(data);
-                const newChunk = new EncodedAudioChunk({
+                muxer.addAudioChunk(new EncodedAudioChunk({
                   type: chunk.type,
-                  timestamp: timestamp,
+                  timestamp,
                   duration: chunk.duration ?? undefined,
-                  data: data
-                });
-
-                muxer.addAudioChunk(newChunk, { decoderConfig: currentAudioConfig });
+                  data
+                }), { decoderConfig: currentAudioConfig });
               }
             } finally {
               audioReader.releaseLock();
               await audioStream.cancel();
             }
           }
-        };
 
-        if (isCompatible) {
-          // Fast Path (Remuxing)
-          const stream = demuxer.read('video');
-          const reader = stream.getReader();
-          
-          try {
-            while (true) {
-              const { done, value: chunk } = await reader.read();
-              if (done) break;
-              
-              if (clipVideoOffset === null) clipVideoOffset = chunk.timestamp;
-              let timestamp = (chunk.timestamp - clipVideoOffset) + accumulatedTimeMicros;
-
-              if (timestamp <= lastDts) {
-                timestamp = lastDts + 1;
-              }
-              lastDts = timestamp;
-
-              const data = new Uint8Array(chunk.byteLength);
-              chunk.copyTo(data);
-              const newChunk = new EncodedVideoChunk({
-                type: chunk.type,
-                timestamp: timestamp,
-                duration: chunk.duration ?? undefined,
-                data: data
-              });
-
-              muxer.addVideoChunk(newChunk, { decoderConfig: currentConfig });
-              clipMaxTime = Math.max(clipMaxTime, timestamp - accumulatedTimeMicros + (chunk.duration ?? 0));
-
-              // Update progress
-              const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
-              const totalProgress = ((i + currentVideoProgress) / videos.length) * 90;
-              setProgress(Math.round(totalProgress));
-              setStatus(`Stitching video ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}% (Fast)`);
-            }
-          } finally {
-            reader.releaseLock();
-            await stream.cancel();
-          }
-        } else {
-          // Slow Path (Transcoding)
-          clipContext.pendingFrames = [];
-          clipContext.clipVideoOffset = null;
-          clipContext.clipMaxTime = 0;
-          clipContext.frameCount = 0;
-
-          if (decoder!.state === 'closed') {
-            throw new Error('VideoDecoder was closed unexpectedly.');
-          }
-
-          // Use reset() to clear state from previous clip without destroying the hardware handle
-          decoder!.reset();
-          decoder!.configure(currentConfig);
-
-          const stream = demuxer.read('video');
-          const reader = stream.getReader();
-          
-          try {
-            while (true) {
-              const { done, value: chunk } = await reader.read();
-              if (done) break;
-              
-              // Decoder Backpressure Handling (More conservative for mobile)
-              if (decoder!.decodeQueueSize > 4) {
-                await delay(20);
-              }
-
-              decoder!.decode(chunk);
-
-              // Update progress
-              const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
-              const totalProgress = ((i + currentVideoProgress) / videos.length) * 90;
-              setProgress(Math.round(totalProgress));
-              setStatus(`Stitching video ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
-            }
-          } finally {
-            reader.releaseLock();
-            await stream.cancel();
-          }
-
-          await decoder!.flush();
-          await Promise.all(clipContext.pendingFrames);
-          clipMaxTime = clipContext.clipMaxTime;
+          accumulatedTimeMicros += Math.max(clipMaxTime, Math.round(videoDuration * 1_000_000));
+          console.log(`[Clip ${i + 1}] DONE. Accumulated Time: ${accumulatedTimeMicros}us`);
+          setProgress(Math.round(((i + 1) / videos.length) * 90));
+        } finally {
+          await demuxer.destroy();
         }
-
-        await remuxAudio();
-        
-        accumulatedTimeMicros += Math.max(clipMaxTime, Math.round(videoDuration * 1_000_000));
       }
 
       setStatus('Finalizing video...');
+      console.log('[Finalize] Flushing encoder...');
       setProgress(95);
       await encoder.flush();
       muxer.finalize();
       
+      console.log('[Finalize] Muxer finalized. Triggering download.');
       const { buffer } = muxer.target as ArrayBufferTarget;
       const blob = new Blob([buffer], { type: 'video/mp4' });
       const downloadUrl = URL.createObjectURL(blob);
@@ -488,20 +458,16 @@ function App() {
       setProgress(100);
       setIsDone(true);
       setStatus('Finished!');
+      console.log('--- STITCH ENGINE COMPLETE ---');
     } catch (err) {
-      console.error(err);
-      setError(err instanceof Error ? err.message : 'An unexpected error occurred during stitching.');
+      console.error('[Engine] FATAL ERROR:', err);
+      setError(err instanceof Error ? err.message : 'An unexpected error occurred.');
     } finally {
       setProcessing(false);
-      demuxer.destroy();
-      if (encoder && encoder.state !== 'closed') {
-        encoder.close();
-      }
-      if (decoder && decoder.state !== 'closed') {
-        decoder.close();
-      }
+      if (encoder && encoder.state !== 'closed') encoder.close();
     }
   };
+
 
   if (!loaded) {
     return (
@@ -572,6 +538,16 @@ function App() {
           <p>Your download should have started automatically.</p>
           <button onClick={() => setIsDone(false)} className={styles.secondaryBtn}>
             Start New Project
+          </button>
+        </div>
+      )}
+
+      {videos.length > 0 && !processing && !isDone && (
+        <div className={styles.listHeader}>
+          <h3>{videos.length} Videos Added</h3>
+          <button onClick={clearVideos} className={styles.clearBtn}>
+            <Trash2 size={16} />
+            Clear All
           </button>
         </div>
       )}
