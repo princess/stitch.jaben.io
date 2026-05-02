@@ -34,6 +34,8 @@ const areBuffersEqual = (a: AllowSharedBufferSource | undefined, b: AllowSharedB
   return true;
 };
 
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 interface VideoFile {
   id: string;
   file: File;
@@ -127,6 +129,7 @@ function App() {
     setProgress(0);
 
     let encoder: VideoEncoder | null = null;
+    let decoder: VideoDecoder | null = null;
     const demuxer = new WebDemuxer({
       wasmFilePath: `${window.location.origin}/wasm-files/web-demuxer.wasm`
     });
@@ -224,6 +227,83 @@ function App() {
         throw new Error('Failed to initialize 2D context for transcoding.');
       }
 
+      // Shared context for VideoDecoder callback
+      const clipContext = {
+        pendingFrames: [] as Promise<void>[],
+        clipVideoOffset: null as number | null,
+        clipMaxTime: 0,
+        frameCount: 0,
+      };
+
+      decoder = new VideoDecoder({
+        output: (frame) => {
+          const frameTask = (async (f: VideoFrame) => {
+            try {
+              if (clipContext.clipVideoOffset === null) clipContext.clipVideoOffset = f.timestamp;
+              const timestampMicros = (f.timestamp - clipContext.clipVideoOffset) + accumulatedTimeMicros;
+              
+              let frameToEncode: VideoFrame;
+              clipContext.clipMaxTime = Math.max(clipContext.clipMaxTime, timestampMicros - accumulatedTimeMicros + (f.duration ?? 0));
+
+              if (f.displayWidth === targetWidth && f.displayHeight === targetHeight) {
+                // Optimization: If dimensions match exactly, we can skip drawImage
+                frameToEncode = new VideoFrame(f, {
+                  timestamp: timestampMicros,
+                  duration: f.duration || undefined
+                });
+              } else {
+                // Clear to black for pillarboxing/letterboxing
+                ctx.fillStyle = 'black';
+                ctx.fillRect(0, 0, targetWidth, targetHeight);
+
+                const videoWidth = f.displayWidth;
+                const videoHeight = f.displayHeight;
+                const videoAspectRatio = videoWidth / videoHeight;
+                const targetAspectRatio = targetWidth / targetHeight;
+
+                let drawWidth = targetWidth;
+                let drawHeight = targetHeight;
+                let offsetX = 0;
+                let offsetY = 0;
+
+                if (videoAspectRatio > targetAspectRatio) {
+                  // Video is wider than target: letterbox
+                  drawHeight = targetWidth / videoAspectRatio;
+                  offsetY = (targetHeight - drawHeight) / 2;
+                } else {
+                  // Video is taller than target: pillarbox
+                  drawWidth = targetHeight * videoAspectRatio;
+                  offsetX = (targetWidth - drawWidth) / 2;
+                }
+
+                ctx.drawImage(f, offsetX, offsetY, drawWidth, drawHeight);
+                
+                frameToEncode = new VideoFrame(canvas, {
+                  timestamp: timestampMicros,
+                  duration: f.duration || undefined
+                });
+              }
+              
+              // Encoder Backpressure Handling (More conservative for mobile)
+              if (encoder!.encodeQueueSize > 10) {
+                await delay(20);
+              }
+
+              encoder!.encode(frameToEncode, { keyFrame: clipContext.frameCount % 120 === 0 });
+              frameToEncode.close();
+              clipContext.frameCount++;
+            } finally {
+              f.close();
+            }
+          })(frame);
+          clipContext.pendingFrames.push(frameTask);
+        },
+        error: (e) => {
+          console.error('VideoDecoder error:', e);
+          setError('Decoder error: ' + e.message);
+        }
+      });
+
       for (let i = 0; i < videos.length; i++) {
         const videoFile = videos[i].file;
         await demuxer.load(videoFile);
@@ -247,6 +327,17 @@ function App() {
           currentConfig.codedWidth === targetWidth &&
           currentConfig.codedHeight === targetHeight &&
           areBuffersEqual(currentConfig.description, targetDescription);
+
+        // Hardening: Explicitly reset canvas resolution to force GPU buffer flush between clips
+        // This can help prevent stalls on mobile hardware where buffer management is aggressive.
+        if (i > 0) {
+          setStatus(`Hardening hardware state (${i}/${videos.length})...`);
+          canvas.width = 0;
+          canvas.height = 0;
+          await delay(100); // Allow hardware to breathe and flush
+          canvas.width = targetWidth;
+          canvas.height = targetHeight;
+        }
 
         // Remux audio if available and compatible
         const remuxAudio = async () => {
@@ -332,78 +423,18 @@ function App() {
           }
         } else {
           // Slow Path (Transcoding)
-          let frameCount = 0;
-          const pendingFrames: Promise<void>[] = [];
-          const decoder = new VideoDecoder({
-            output: (frame) => {
-              const frameTask = (async (f: VideoFrame) => {
-                try {
-                  if (clipVideoOffset === null) clipVideoOffset = f.timestamp;
-                  const timestampMicros = (f.timestamp - clipVideoOffset) + accumulatedTimeMicros;
-                  
-                  let frameToEncode: VideoFrame;
-                  clipMaxTime = Math.max(clipMaxTime, timestampMicros - accumulatedTimeMicros + (f.duration ?? 0));
+          clipContext.pendingFrames = [];
+          clipContext.clipVideoOffset = null;
+          clipContext.clipMaxTime = 0;
+          clipContext.frameCount = 0;
 
-                  if (f.displayWidth === targetWidth && f.displayHeight === targetHeight) {
-                    // Optimization: If dimensions match exactly, we can skip drawImage
-                    frameToEncode = new VideoFrame(f, {
-                      timestamp: timestampMicros,
-                      duration: f.duration || undefined
-                    });
-                  } else {
-                    // Clear to black for pillarboxing/letterboxing
-                    ctx.fillStyle = 'black';
-                    ctx.fillRect(0, 0, targetWidth, targetHeight);
+          if (decoder!.state === 'closed') {
+            throw new Error('VideoDecoder was closed unexpectedly.');
+          }
 
-                    const videoWidth = f.displayWidth;
-                    const videoHeight = f.displayHeight;
-                    const videoAspectRatio = videoWidth / videoHeight;
-                    const targetAspectRatio = targetWidth / targetHeight;
-
-                    let drawWidth = targetWidth;
-                    let drawHeight = targetHeight;
-                    let offsetX = 0;
-                    let offsetY = 0;
-
-                    if (videoAspectRatio > targetAspectRatio) {
-                      // Video is wider than target: letterbox
-                      drawHeight = targetWidth / videoAspectRatio;
-                      offsetY = (targetHeight - drawHeight) / 2;
-                    } else {
-                      // Video is taller than target: pillarbox
-                      drawWidth = targetHeight * videoAspectRatio;
-                      offsetX = (targetWidth - drawWidth) / 2;
-                    }
-
-                    ctx.drawImage(f, offsetX, offsetY, drawWidth, drawHeight);
-                    
-                    frameToEncode = new VideoFrame(canvas, {
-                      timestamp: timestampMicros,
-                      duration: f.duration || undefined
-                    });
-                  }
-                  
-                  // Encoder Backpressure Handling
-                  if (encoder!.encodeQueueSize > 20) {
-                    await new Promise(r => setTimeout(r, 10));
-                  }
-
-                  encoder!.encode(frameToEncode, { keyFrame: frameCount % 120 === 0 });
-                  frameToEncode.close();
-                  frameCount++;
-                } finally {
-                  f.close();
-                }
-              })(frame);
-              pendingFrames.push(frameTask);
-            },
-            error: (e) => {
-              console.error('VideoDecoder error:', e);
-              setError('Decoder error: ' + e.message);
-            }
-          });
-
-          decoder.configure(currentConfig);
+          // Use reset() to clear state from previous clip without destroying the hardware handle
+          decoder!.reset();
+          decoder!.configure(currentConfig);
 
           const stream = demuxer.read('video');
           const reader = stream.getReader();
@@ -413,12 +444,12 @@ function App() {
               const { done, value: chunk } = await reader.read();
               if (done) break;
               
-              // Decoder Backpressure Handling
-              if (decoder.decodeQueueSize > 5) {
-                await new Promise(r => setTimeout(r, 10));
+              // Decoder Backpressure Handling (More conservative for mobile)
+              if (decoder!.decodeQueueSize > 4) {
+                await delay(20);
               }
 
-              decoder.decode(chunk);
+              decoder!.decode(chunk);
 
               // Update progress
               const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
@@ -431,9 +462,9 @@ function App() {
             await stream.cancel();
           }
 
-          await decoder.flush();
-          await Promise.all(pendingFrames);
-          decoder.close();
+          await decoder!.flush();
+          await Promise.all(clipContext.pendingFrames);
+          clipMaxTime = clipContext.clipMaxTime;
         }
 
         await remuxAudio();
@@ -465,6 +496,9 @@ function App() {
       demuxer.destroy();
       if (encoder && encoder.state !== 'closed') {
         encoder.close();
+      }
+      if (decoder && decoder.state !== 'closed') {
+        decoder.close();
       }
     }
   };
