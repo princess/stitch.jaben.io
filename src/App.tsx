@@ -368,12 +368,33 @@ function App() {
                       frameToEncode = new VideoFrame(canvas, { timestamp: timestampMicros, duration: frame.duration || undefined });
                     }
                     
-                    if (encoder!.encodeQueueSize > 10) await delay(10);
+                    // Encoder Backpressure Handling with safety timeout
+                    if (encoder!.encodeQueueSize > 32) {
+                      let waitStart = Date.now();
+                      while (encoder!.encodeQueueSize > 32) {
+                        await delay(10);
+                        if (Date.now() - waitStart > 5000) {
+                          throw new Error('Encoder timed out (backpressure stall).');
+                        }
+                      }
+                    }
+
                     if (encoder?.state === 'configured') {
                       encoder!.encode(frameToEncode, { keyFrame: clipContext.frameCount % 120 === 0 });
                     }
                     frameToEncode.close();
                     clipContext.frameCount++;
+
+                    // Update progress based on ENCODED frames
+                    if (clipContext.frameCount % 30 === 0) {
+                      const currentVideoProgress = videoDuration > 0 ? Math.min(timestampMicros / (videoDuration * 1_000_000), 1) : 0;
+                      const totalProgress = Math.round(((i + currentVideoProgress) / videos.length) * 90);
+                      setProgress(totalProgress);
+                      setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
+                      
+                      // Heartbeat log
+                      console.log(`[Clip ${i+1}] Encoded ${clipContext.frameCount} frames.`);
+                    }
                   } catch (e) {
                     console.error('[FrameTask] Error:', e);
                   } finally {
@@ -390,34 +411,60 @@ function App() {
             decoder.configure(currentConfig);
             const stream = demuxer.read('video');
             const reader = stream.getReader();
+            
+            // Set an initial status so it doesn't look stuck at 0%
+            setStatus(`Stitching ${i + 1}/${videos.length}: Starting transcode...`);
+
             try {
               while (true) {
+                // Monitor for fatal errors in either component
+                if (encoder?.state === 'errored' || decoder.state === 'errored') {
+                  throw new Error(`Pipeline failed: Encoder=${encoder?.state}, Decoder=${decoder.state}`);
+                }
+                
+                if (encoder?.state === 'closed' || decoder.state === 'closed') break;
+
                 const { done, value: chunk } = await reader.read();
                 if (done) break;
-                if (decoder.decodeQueueSize > 8) await delay(10);
-                decoder.decode(chunk);
+                
+                // Increased backpressure limits (32) for smoother hardware pipeline
+                if (decoder.decodeQueueSize > 32) await delay(10);
+                
+                try {
+                  decoder.decode(chunk);
+                } catch (decodeErr) {
+                  console.error('[Decode] Fatal decode call error:', decodeErr);
+                  throw decodeErr;
+                }
 
                 chunkCount++;
-                if (chunkCount % 30 === 0) {
-                  const currentVideoProgress = videoDuration > 0 ? Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1) : 0;
-                  const totalProgress = Math.round(((i + currentVideoProgress) / videos.length) * 90);
-                  setProgress(totalProgress);
-                  setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
+                if (chunkCount % 100 === 0) {
+                  // Heartbeat log to prove the loop is moving
+                  console.log(`[Clip ${i+1}] Decoded ${chunkCount} chunks. Queue: ${decoder.decodeQueueSize}`);
                 }
               }
-              // Final progress update for this clip
-              setProgress(Math.round(((i + 1) / videos.length) * 90));
-              setStatus(`Stitching ${i + 1}/${videos.length}: 100%`);
             } finally {
               reader.releaseLock();
               await stream.cancel();
             }
 
-            console.log(`[Clip ${i + 1}] Finalizing decodes...`);
-            await decoder.flush();
+            console.log(`[Clip ${i + 1}] Drained demuxer. Finalizing pipeline...`);
+            setStatus(`Stitching ${i + 1}/${videos.length}: Finalizing...`);
+            
+            if (decoder.state === 'configured') {
+              await decoder.flush();
+            }
+            
+            // Await the sequential encoding chain
             await clipContext.encodingPromise;
             clipMaxTime = clipContext.clipMaxTime;
-            decoder.close();
+            
+            if (decoder.state !== 'closed') {
+              decoder.close();
+            }
+            
+            console.log(`[Clip ${i + 1}] Decoder closed cleanly.`);
+            setProgress(Math.round(((i + 1) / videos.length) * 90));
           }
 
           // Process Audio
