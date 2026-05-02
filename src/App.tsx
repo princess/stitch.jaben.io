@@ -417,9 +417,9 @@ function App() {
 
             try {
               while (true) {
-                // Monitor for fatal errors in either component
-                if (encoder?.state === 'errored' || decoder.state === 'errored') {
-                  throw new Error(`Pipeline failed: Encoder=${encoder?.state}, Decoder=${decoder.state}`);
+                // Monitor for fatal errors via React state or closure
+                if (error) {
+                  throw new Error(error);
                 }
                 
                 if (encoder?.state === 'closed' || decoder.state === 'closed') break;
