@@ -224,7 +224,6 @@ function App() {
       
       const optimizedEncoderConfig: VideoEncoderConfig = {
         ...baseEncoderConfig,
-        latencyMode: 'realtime',
         hardwareAcceleration: 'prefer-hardware',
       };
 
@@ -243,6 +242,16 @@ function App() {
       const ctx = canvas.getContext('2d', { alpha: false });
       
       if (!ctx) throw new Error('Failed to initialize 2D context.');
+
+      // Watchdog helper to prevent silent hangs in stream reading
+      const readWithTimeout = async (reader: ReadableStreamDefaultReader<any>, timeoutMs = 10000) => {
+        return Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => 
+            setTimeout(() => reject(new Error('Stream read timed out (possible file corruption).')), timeoutMs)
+          )
+        ]);
+      };
 
       for (let i = 0; i < videos.length; i++) {
         const videoFile = videos[i].file;
@@ -286,217 +295,234 @@ function App() {
           let clipMaxTime = 0;
           let clipVideoOffset: number | null = null;
           let clipAudioOffset: number | null = null;
-          let chunkCount = 0;
 
-          // Process Video
-          if (isCompatible) {
-            const stream = demuxer.read('video');
-            const reader = stream.getReader();
-            try {
-              while (true) {
-                const { done, value: chunk } = await reader.read();
-                if (done) break;
-                
-                if (clipVideoOffset === null) clipVideoOffset = chunk.timestamp;
-                let timestamp = (chunk.timestamp - clipVideoOffset) + accumulatedTimeMicros;
-                if (timestamp <= lastDts) timestamp = lastDts + 1;
-                lastDts = timestamp;
+          const processVideo = async () => {
+            let chunkCount = 0;
+            if (isCompatible) {
+              const stream = demuxer.read('video');
+              const reader = stream.getReader();
+              try {
+                while (true) {
+                  if (error) throw new Error(error);
+                  const { done, value: chunk } = await readWithTimeout(reader);
+                  if (done) break;
+                  
+                  if (clipVideoOffset === null) clipVideoOffset = chunk.timestamp;
+                  let timestamp = (chunk.timestamp - clipVideoOffset!) + accumulatedTimeMicros;
+                  if (timestamp <= lastDts) timestamp = lastDts + 1;
+                  lastDts = timestamp;
 
-                const data = new Uint8Array(chunk.byteLength);
-                chunk.copyTo(data);
-                muxer.addVideoChunk(new EncodedVideoChunk({
-                  type: chunk.type,
-                  timestamp,
-                  duration: chunk.duration ?? undefined,
-                  data
-                }), { decoderConfig: currentConfig });
-
-                clipMaxTime = Math.max(clipMaxTime, timestamp - accumulatedTimeMicros + (chunk.duration ?? 0));
-                
-                chunkCount++;
-                if (chunkCount % 30 === 0) {
-                  const currentVideoProgress = videoDuration > 0 ? Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1) : 0;
-                  const totalProgress = Math.round(((i + currentVideoProgress) / videos.length) * 90);
-                  setProgress(totalProgress);
-                  setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}% (Fast)`);
-                }
-              }
-              // Final progress update for this clip
-              setProgress(Math.round(((i + 1) / videos.length) * 90));
-              setStatus(`Stitching ${i + 1}/${videos.length}: 100% (Fast)`);
-            } finally {
-              reader.releaseLock();
-              await stream.cancel();
-            }
-          } else {
-            const clipContext = {
-              encodingPromise: Promise.resolve(),
-              clipVideoOffset: null as number | null,
-              clipMaxTime: 0,
-              frameCount: 0,
-            };
-
-            const decoder = new VideoDecoder({
-              output: (frame) => {
-                const timestampMicros = (frame.timestamp - (clipContext.clipVideoOffset ?? frame.timestamp)) + accumulatedTimeMicros;
-                if (clipContext.clipVideoOffset === null) clipContext.clipVideoOffset = frame.timestamp;
-                
-                // Use a promise chain to ensure frames are processed in order
-                clipContext.encodingPromise = clipContext.encodingPromise.then(async () => {
+                  const data = new Uint8Array(chunk.byteLength);
+                  chunk.copyTo(data);
+                  
                   try {
-                    if (encoder?.state !== 'configured') return;
-                    
-                    let frameToEncode: VideoFrame;
-                    clipContext.clipMaxTime = Math.max(clipContext.clipMaxTime, timestampMicros - accumulatedTimeMicros + (frame.duration ?? 0));
+                    muxer!.addVideoChunk(new EncodedVideoChunk({
+                      type: chunk.type,
+                      timestamp,
+                      duration: chunk.duration ?? undefined,
+                      data
+                    }), { decoderConfig: currentConfig });
+                  } catch (muxErr) {
+                    console.error('[Muxer] Video chunk error:', muxErr);
+                    throw muxErr;
+                  }
 
-                    if (frame.displayWidth === targetWidth && frame.displayHeight === targetHeight) {
-                      frameToEncode = new VideoFrame(frame, { timestamp: timestampMicros, duration: frame.duration || undefined });
-                    } else {
-                      ctx.fillStyle = 'black';
-                      ctx.fillRect(0, 0, targetWidth, targetHeight);
-                      const videoAspectRatio = frame.displayWidth / frame.displayHeight;
-                      const targetAspectRatio = targetWidth / targetHeight;
-                      let drawW = targetWidth, drawH = targetHeight, offX = 0, offY = 0;
-                      if (videoAspectRatio > targetAspectRatio) {
-                        drawH = targetWidth / videoAspectRatio;
-                        offY = (targetHeight - drawH) / 2;
+                  clipMaxTime = Math.max(clipMaxTime, timestamp - accumulatedTimeMicros + (chunk.duration ?? 0));
+                  
+                  chunkCount++;
+                  if (chunkCount % 50 === 0) {
+                    const currentVideoProgress = videoDuration > 0 ? Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1) : 0;
+                    const totalProgress = Math.round(((i + currentVideoProgress) / videos.length) * 90);
+                    setProgress(totalProgress);
+                    setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}% (Fast)`);
+                  }
+                }
+              } finally {
+                reader.releaseLock();
+                await stream.cancel();
+              }
+            } else {
+              const clipContext = {
+                encodingPromise: Promise.resolve(),
+                clipVideoOffset: null as number | null,
+                clipMaxTime: 0,
+                frameCount: 0,
+              };
+
+              const decoder = new VideoDecoder({
+                output: (frame) => {
+                  const timestampMicros = (frame.timestamp - (clipContext.clipVideoOffset ?? frame.timestamp)) + accumulatedTimeMicros;
+                  if (clipContext.clipVideoOffset === null) clipContext.clipVideoOffset = frame.timestamp;
+                  
+                  // Use a promise chain to ensure frames are processed in order
+                  clipContext.encodingPromise = clipContext.encodingPromise.then(async () => {
+                    try {
+                      if (error) return;
+                      if (encoder?.state !== 'configured') return;
+                      
+                      let frameToEncode: VideoFrame;
+                      clipContext.clipMaxTime = Math.max(clipContext.clipMaxTime, timestampMicros - accumulatedTimeMicros + (frame.duration ?? 0));
+
+                      if (frame.displayWidth === targetWidth && frame.displayHeight === targetHeight) {
+                        frameToEncode = new VideoFrame(frame, { timestamp: timestampMicros, duration: frame.duration || undefined });
                       } else {
-                        drawW = targetHeight * videoAspectRatio;
-                        offX = (targetWidth - drawW) / 2;
+                        ctx.fillStyle = 'black';
+                        ctx.fillRect(0, 0, targetWidth, targetHeight);
+                        const videoAspectRatio = frame.displayWidth / frame.displayHeight;
+                        const targetAspectRatio = targetWidth / targetHeight;
+                        let drawW = targetWidth, drawH = targetHeight, offX = 0, offY = 0;
+                        if (videoAspectRatio > targetAspectRatio) {
+                          drawH = targetWidth / videoAspectRatio;
+                          offY = (targetHeight - drawH) / 2;
+                        } else {
+                          drawW = targetHeight * videoAspectRatio;
+                          offX = (targetWidth - drawW) / 2;
+                        }
+                        ctx.drawImage(frame, offX, offY, drawW, drawH);
+                        frameToEncode = new VideoFrame(canvas, { timestamp: timestampMicros, duration: frame.duration || undefined });
                       }
-                      ctx.drawImage(frame, offX, offY, drawW, drawH);
-                      frameToEncode = new VideoFrame(canvas, { timestamp: timestampMicros, duration: frame.duration || undefined });
-                    }
-                    
-                    // Encoder Backpressure Handling with safety timeout
-                    if (encoder!.encodeQueueSize > 32) {
-                      let waitStart = Date.now();
-                      while (encoder!.encodeQueueSize > 32) {
-                        await delay(10);
-                        if (Date.now() - waitStart > 5000) {
-                          throw new Error('Encoder timed out (backpressure stall).');
+                      
+                      // Encoder Backpressure Handling with safety timeout
+                      if (encoder!.encodeQueueSize > 128) {
+                        let waitStart = Date.now();
+                        while (encoder!.encodeQueueSize > 128) {
+                          await new Promise(r => setTimeout(r, 0));
+                          if (Date.now() - waitStart > 5000) {
+                            throw new Error('Encoder timed out (backpressure stall).');
+                          }
                         }
                       }
-                    }
 
-                    if (encoder?.state === 'configured') {
-                      encoder!.encode(frameToEncode, { keyFrame: clipContext.frameCount % 120 === 0 });
-                    }
-                    frameToEncode.close();
-                    clipContext.frameCount++;
+                      if (encoder?.state === 'configured') {
+                        try {
+                          encoder!.encode(frameToEncode, { keyFrame: clipContext.frameCount % 120 === 0 });
+                        } catch (encErr) {
+                          console.error('[Encoder] Encode call error:', encErr);
+                          throw encErr;
+                        }
+                      }
+                      frameToEncode.close();
+                      clipContext.frameCount++;
 
-                    // Update progress based on ENCODED frames
-                    if (clipContext.frameCount % 30 === 0) {
-                      const currentVideoProgress = videoDuration > 0 ? Math.min(timestampMicros / (videoDuration * 1_000_000), 1) : 0;
-                      const totalProgress = Math.round(((i + currentVideoProgress) / videos.length) * 90);
-                      setProgress(totalProgress);
-                      setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
-                      
-                      // Heartbeat log
-                      console.log(`[Clip ${i+1}] Encoded ${clipContext.frameCount} frames.`);
+                      // Update progress based on ENCODED frames
+                      if (clipContext.frameCount % 30 === 0) {
+                        const currentVideoProgress = videoDuration > 0 ? Math.min(timestampMicros / (videoDuration * 1_000_000), 1) : 0;
+                        const totalProgress = Math.round(((i + currentVideoProgress) / videos.length) * 90);
+                        setProgress(totalProgress);
+                        setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
+                      }
+                    } catch (e) {
+                      console.error('[FrameTask] Error:', e);
+                      setError(e instanceof Error ? e.message : 'Encoding frame task failed.');
+                    } finally {
+                      frame.close();
                     }
-                  } catch (e) {
-                    console.error('[FrameTask] Error:', e);
-                  } finally {
-                    frame.close();
+                  });
+                },
+                error: (e) => {
+                  console.error(`[Decoder Clip ${i+1}] ERROR:`, e);
+                  setError(`Decoder error: ${e.message}`);
+                }
+              });
+
+              decoder.configure(currentConfig);
+              const stream = demuxer.read('video');
+              const reader = stream.getReader();
+              
+              setStatus(`Stitching ${i + 1}/${videos.length}: Starting transcode...`);
+
+              try {
+                while (true) {
+                  // Monitor for fatal errors via React state or closure
+                  if (error) throw new Error(error);
+                  
+                  if (encoder?.state === 'closed' || decoder.state === 'closed') break;
+
+                  const { done, value: chunk } = await readWithTimeout(reader);
+                  if (done) break;
+                  
+                  if (decoder.decodeQueueSize > 128) await new Promise(r => setTimeout(r, 0));
+                  
+                  try {
+                    decoder.decode(chunk);
+                  } catch (decodeErr) {
+                    console.error('[Decode] Fatal decode call error:', decodeErr);
+                    throw decodeErr;
                   }
-                });
-              },
-              error: (e) => {
-                console.error(`[Decoder Clip ${i+1}] ERROR:`, e);
-                setError(`Decoder error: ${e.message}`);
-              }
-            });
 
-            decoder.configure(currentConfig);
-            const stream = demuxer.read('video');
-            const reader = stream.getReader();
-            
-            // Set an initial status so it doesn't look stuck at 0%
-            setStatus(`Stitching ${i + 1}/${videos.length}: Starting transcode...`);
-
-            try {
-              while (true) {
-                // Monitor for fatal errors via React state or closure
-                if (error) {
-                  throw new Error(error);
+                  chunkCount++;
+                  if (chunkCount % 100 === 0) {
+                    console.log(`[Clip ${i+1}] Decoded ${chunkCount} chunks. Queue: ${decoder.decodeQueueSize}`);
+                  }
                 }
-                
-                if (encoder?.state === 'closed' || decoder.state === 'closed') break;
-
-                const { done, value: chunk } = await reader.read();
-                if (done) break;
-                
-                // Increased backpressure limits (32) for smoother hardware pipeline
-                if (decoder.decodeQueueSize > 32) await delay(10);
-                
-                try {
-                  decoder.decode(chunk);
-                } catch (decodeErr) {
-                  console.error('[Decode] Fatal decode call error:', decodeErr);
-                  throw decodeErr;
-                }
-
-                chunkCount++;
-                if (chunkCount % 100 === 0) {
-                  // Heartbeat log to prove the loop is moving
-                  console.log(`[Clip ${i+1}] Decoded ${chunkCount} chunks. Queue: ${decoder.decodeQueueSize}`);
-                }
+              } finally {
+                reader.releaseLock();
+                await stream.cancel();
               }
-            } finally {
-              reader.releaseLock();
-              await stream.cancel();
-            }
 
-            console.log(`[Clip ${i + 1}] Drained demuxer. Finalizing pipeline...`);
-            setStatus(`Stitching ${i + 1}/${videos.length}: Finalizing...`);
-            
-            if (decoder.state === 'configured') {
-              await decoder.flush();
-            }
-            
-            // Await the sequential encoding chain
-            await clipContext.encodingPromise;
-            clipMaxTime = clipContext.clipMaxTime;
-            
-            if (decoder.state !== 'closed') {
-              decoder.close();
-            }
-            
-            console.log(`[Clip ${i + 1}] Decoder closed cleanly.`);
-            setProgress(Math.round(((i + 1) / videos.length) * 90));
-          }
-
-          // Process Audio
-          if (targetAudioConfig && currentAudioConfig && 
-              currentAudioConfig.codec === targetAudioConfig.codec &&
-              currentAudioConfig.sampleRate === targetAudioConfig.sampleRate &&
-              currentAudioConfig.numberOfChannels === targetAudioConfig.numberOfChannels) {
-            console.log(`[Clip ${i + 1}] Audio compatible. Remuxing...`);
-            const audioStream = demuxer.read('audio');
-            const audioReader = audioStream.getReader();
-            try {
-              while (true) {
-                const { done, value: chunk } = await audioReader.read();
-                if (done) break;
-                if (clipAudioOffset === null) clipAudioOffset = chunk.timestamp;
-                let timestamp = (chunk.timestamp - clipAudioOffset) + accumulatedTimeMicros;
-                if (timestamp <= lastAudioDts) timestamp = lastAudioDts + 1;
-                lastAudioDts = timestamp;
-                const data = new Uint8Array(chunk.byteLength);
-                chunk.copyTo(data);
-                muxer.addAudioChunk(new EncodedAudioChunk({
-                  type: chunk.type,
-                  timestamp,
-                  duration: chunk.duration ?? undefined,
-                  data
-                }), { decoderConfig: currentAudioConfig });
+              console.log(`[Clip ${i + 1}] Drained demuxer. Finalizing pipeline...`);
+              setStatus(`Stitching ${i + 1}/${videos.length}: Finalizing...`);
+              
+              if (decoder.state === 'configured') {
+                await decoder.flush();
               }
-            } finally {
-              audioReader.releaseLock();
-              await audioStream.cancel();
+              
+              await clipContext.encodingPromise;
+              clipMaxTime = clipContext.clipMaxTime;
+              
+              if (decoder.state !== 'closed') {
+                decoder.close();
+              }
+              
+              console.log(`[Clip ${i + 1}] Decoder closed cleanly.`);
             }
-          }
+          };
+
+          const processAudio = async () => {
+            if (targetAudioConfig && currentAudioConfig && 
+                currentAudioConfig.codec === targetAudioConfig.codec &&
+                currentAudioConfig.sampleRate === targetAudioConfig.sampleRate &&
+                currentAudioConfig.numberOfChannels === targetAudioConfig.numberOfChannels) {
+              console.log(`[Clip ${i + 1}] Audio compatible. Remuxing...`);
+              
+              const audioStream = demuxer.read('audio');
+              const audioReader = audioStream.getReader();
+              let audioChunkCount = 0;
+              try {
+                while (true) {
+                  if (error) throw new Error(error);
+                  const { done, value: chunk } = await readWithTimeout(audioReader);
+                  if (done) break;
+
+                  if (clipAudioOffset === null) clipAudioOffset = chunk.timestamp;
+                  let timestamp = (chunk.timestamp - clipAudioOffset!) + accumulatedTimeMicros;
+                  if (timestamp <= lastAudioDts) timestamp = lastAudioDts + 1;
+                  lastAudioDts = timestamp;
+                  const data = new Uint8Array(chunk.byteLength);
+                  chunk.copyTo(data);
+                  
+                  try {
+                    muxer!.addAudioChunk(new EncodedAudioChunk({
+                      type: chunk.type,
+                      timestamp,
+                      duration: chunk.duration ?? undefined,
+                      data
+                    }), { decoderConfig: currentAudioConfig });
+                  } catch (muxErr) {
+                    console.error('[Muxer] Audio chunk error:', muxErr);
+                    throw muxErr;
+                  }
+
+                  audioChunkCount++;
+                }
+              } finally {
+                audioReader.releaseLock();
+                await audioStream.cancel();
+              }
+            }
+          };
+
+          await Promise.all([processVideo(), processAudio()]);
 
           accumulatedTimeMicros += Math.max(clipMaxTime, Math.round(videoDuration * 1_000_000));
           console.log(`[Clip ${i + 1}] DONE. Accumulated Time: ${accumulatedTimeMicros}us`);
