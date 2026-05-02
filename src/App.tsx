@@ -286,6 +286,7 @@ function App() {
           let clipMaxTime = 0;
           let clipVideoOffset: number | null = null;
           let clipAudioOffset: number | null = null;
+          let chunkCount = 0;
 
           // Process Video
           if (isCompatible) {
@@ -312,18 +313,24 @@ function App() {
 
                 clipMaxTime = Math.max(clipMaxTime, timestamp - accumulatedTimeMicros + (chunk.duration ?? 0));
                 
-                if (chunk.timestamp % 1_000_000 < 50_000) { // Log every ~1s of video
-                  const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
+                chunkCount++;
+                if (chunkCount % 30 === 0) {
+                  const currentVideoProgress = videoDuration > 0 ? Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1) : 0;
+                  const totalProgress = Math.round(((i + currentVideoProgress) / videos.length) * 90);
+                  setProgress(totalProgress);
                   setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}% (Fast)`);
                 }
               }
+              // Final progress update for this clip
+              setProgress(Math.round(((i + 1) / videos.length) * 90));
+              setStatus(`Stitching ${i + 1}/${videos.length}: 100% (Fast)`);
             } finally {
               reader.releaseLock();
               await stream.cancel();
             }
           } else {
             const clipContext = {
-              pendingFrames: [] as Promise<void>[],
+              encodingPromise: Promise.resolve(),
               clipVideoOffset: null as number | null,
               clipMaxTime: 0,
               frameCount: 0,
@@ -331,20 +338,23 @@ function App() {
 
             const decoder = new VideoDecoder({
               output: (frame) => {
-                const frameTask = (async (f: VideoFrame) => {
+                const timestampMicros = (frame.timestamp - (clipContext.clipVideoOffset ?? frame.timestamp)) + accumulatedTimeMicros;
+                if (clipContext.clipVideoOffset === null) clipContext.clipVideoOffset = frame.timestamp;
+                
+                // Use a promise chain to ensure frames are processed in order
+                clipContext.encodingPromise = clipContext.encodingPromise.then(async () => {
                   try {
-                    if (clipContext.clipVideoOffset === null) clipContext.clipVideoOffset = f.timestamp;
-                    const timestampMicros = (f.timestamp - clipContext.clipVideoOffset) + accumulatedTimeMicros;
+                    if (encoder?.state !== 'configured') return;
                     
                     let frameToEncode: VideoFrame;
-                    clipContext.clipMaxTime = Math.max(clipContext.clipMaxTime, timestampMicros - accumulatedTimeMicros + (f.duration ?? 0));
+                    clipContext.clipMaxTime = Math.max(clipContext.clipMaxTime, timestampMicros - accumulatedTimeMicros + (frame.duration ?? 0));
 
-                    if (f.displayWidth === targetWidth && f.displayHeight === targetHeight) {
-                      frameToEncode = new VideoFrame(f, { timestamp: timestampMicros, duration: f.duration || undefined });
+                    if (frame.displayWidth === targetWidth && frame.displayHeight === targetHeight) {
+                      frameToEncode = new VideoFrame(frame, { timestamp: timestampMicros, duration: frame.duration || undefined });
                     } else {
                       ctx.fillStyle = 'black';
                       ctx.fillRect(0, 0, targetWidth, targetHeight);
-                      const videoAspectRatio = f.displayWidth / f.displayHeight;
+                      const videoAspectRatio = frame.displayWidth / frame.displayHeight;
                       const targetAspectRatio = targetWidth / targetHeight;
                       let drawW = targetWidth, drawH = targetHeight, offX = 0, offY = 0;
                       if (videoAspectRatio > targetAspectRatio) {
@@ -354,19 +364,22 @@ function App() {
                         drawW = targetHeight * videoAspectRatio;
                         offX = (targetWidth - drawW) / 2;
                       }
-                      ctx.drawImage(f, offX, offY, drawW, drawH);
-                      frameToEncode = new VideoFrame(canvas, { timestamp: timestampMicros, duration: f.duration || undefined });
+                      ctx.drawImage(frame, offX, offY, drawW, drawH);
+                      frameToEncode = new VideoFrame(canvas, { timestamp: timestampMicros, duration: frame.duration || undefined });
                     }
                     
                     if (encoder!.encodeQueueSize > 10) await delay(10);
-                    encoder!.encode(frameToEncode, { keyFrame: clipContext.frameCount % 120 === 0 });
+                    if (encoder?.state === 'configured') {
+                      encoder!.encode(frameToEncode, { keyFrame: clipContext.frameCount % 120 === 0 });
+                    }
                     frameToEncode.close();
                     clipContext.frameCount++;
+                  } catch (e) {
+                    console.error('[FrameTask] Error:', e);
                   } finally {
-                    f.close();
+                    frame.close();
                   }
-                })(frame);
-                clipContext.pendingFrames.push(frameTask);
+                });
               },
               error: (e) => {
                 console.error(`[Decoder Clip ${i+1}] ERROR:`, e);
@@ -384,11 +397,17 @@ function App() {
                 if (decoder.decodeQueueSize > 8) await delay(10);
                 decoder.decode(chunk);
 
-                if (chunk.timestamp % 1_000_000 < 50_000) {
-                  const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
+                chunkCount++;
+                if (chunkCount % 30 === 0) {
+                  const currentVideoProgress = videoDuration > 0 ? Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1) : 0;
+                  const totalProgress = Math.round(((i + currentVideoProgress) / videos.length) * 90);
+                  setProgress(totalProgress);
                   setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
                 }
               }
+              // Final progress update for this clip
+              setProgress(Math.round(((i + 1) / videos.length) * 90));
+              setStatus(`Stitching ${i + 1}/${videos.length}: 100%`);
             } finally {
               reader.releaseLock();
               await stream.cancel();
@@ -396,7 +415,7 @@ function App() {
 
             console.log(`[Clip ${i + 1}] Finalizing decodes...`);
             await decoder.flush();
-            await Promise.all(clipContext.pendingFrames);
+            await clipContext.encodingPromise;
             clipMaxTime = clipContext.clipMaxTime;
             decoder.close();
           }
