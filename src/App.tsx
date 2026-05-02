@@ -218,7 +218,11 @@ function App() {
       let lastDts = -1;
       let lastAudioDts = -1;
       const canvas = new OffscreenCanvas(targetWidth, targetHeight);
-      const ctx = canvas.getContext('2d', { alpha: false })!;
+      const ctx = canvas.getContext('2d', { alpha: false });
+      
+      if (!ctx) {
+        throw new Error('Failed to initialize 2D context for transcoding.');
+      }
 
       for (let i = 0; i < videos.length; i++) {
         const videoFile = videos[i].file;
@@ -278,6 +282,7 @@ function App() {
 
               muxer.addAudioChunk(newChunk, { decoderConfig: currentAudioConfig });
             }
+            audioReader.releaseLock();
           }
         };
 
@@ -316,6 +321,7 @@ function App() {
             setProgress(Math.round(totalProgress));
             setStatus(`Stitching video ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}% (Fast)`);
           }
+          reader.releaseLock();
         } else {
           // Slow Path (Transcoding)
           let frameCount = 0;
@@ -399,6 +405,7 @@ function App() {
             setProgress(Math.round(totalProgress));
             setStatus(`Stitching video ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
           }
+          reader.releaseLock();
 
           await decoder.flush();
           decoder.close();
