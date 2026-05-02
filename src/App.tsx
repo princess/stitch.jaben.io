@@ -259,30 +259,34 @@ function App() {
           ) {
             const audioStream = demuxer.read('audio');
             const audioReader = audioStream.getReader();
-            while (true) {
-              const { done, value: chunk } = await audioReader.read();
-              if (done) break;
+            try {
+              while (true) {
+                const { done, value: chunk } = await audioReader.read();
+                if (done) break;
 
-              if (clipAudioOffset === null) clipAudioOffset = chunk.timestamp;
-              let timestamp = (chunk.timestamp - clipAudioOffset) + accumulatedTimeMicros;
-              
-              if (timestamp <= lastAudioDts) {
-                timestamp = lastAudioDts + 1;
+                if (clipAudioOffset === null) clipAudioOffset = chunk.timestamp;
+                let timestamp = (chunk.timestamp - clipAudioOffset) + accumulatedTimeMicros;
+                
+                if (timestamp <= lastAudioDts) {
+                  timestamp = lastAudioDts + 1;
+                }
+                lastAudioDts = timestamp;
+
+                const data = new Uint8Array(chunk.byteLength);
+                chunk.copyTo(data);
+                const newChunk = new EncodedAudioChunk({
+                  type: chunk.type,
+                  timestamp: timestamp,
+                  duration: chunk.duration ?? undefined,
+                  data: data
+                });
+
+                muxer.addAudioChunk(newChunk, { decoderConfig: currentAudioConfig });
               }
-              lastAudioDts = timestamp;
-
-              const data = new Uint8Array(chunk.byteLength);
-              chunk.copyTo(data);
-              const newChunk = new EncodedAudioChunk({
-                type: chunk.type,
-                timestamp: timestamp,
-                duration: chunk.duration ?? undefined,
-                data: data
-              });
-
-              muxer.addAudioChunk(newChunk, { decoderConfig: currentAudioConfig });
+            } finally {
+              audioReader.releaseLock();
+              await audioStream.cancel();
             }
-            audioReader.releaseLock();
           }
         };
 
@@ -291,37 +295,41 @@ function App() {
           const stream = demuxer.read('video');
           const reader = stream.getReader();
           
-          while (true) {
-            const { done, value: chunk } = await reader.read();
-            if (done) break;
-            
-            if (clipVideoOffset === null) clipVideoOffset = chunk.timestamp;
-            let timestamp = (chunk.timestamp - clipVideoOffset) + accumulatedTimeMicros;
+          try {
+            while (true) {
+              const { done, value: chunk } = await reader.read();
+              if (done) break;
+              
+              if (clipVideoOffset === null) clipVideoOffset = chunk.timestamp;
+              let timestamp = (chunk.timestamp - clipVideoOffset) + accumulatedTimeMicros;
 
-            if (timestamp <= lastDts) {
-              timestamp = lastDts + 1;
+              if (timestamp <= lastDts) {
+                timestamp = lastDts + 1;
+              }
+              lastDts = timestamp;
+
+              const data = new Uint8Array(chunk.byteLength);
+              chunk.copyTo(data);
+              const newChunk = new EncodedVideoChunk({
+                type: chunk.type,
+                timestamp: timestamp,
+                duration: chunk.duration ?? undefined,
+                data: data
+              });
+
+              muxer.addVideoChunk(newChunk, { decoderConfig: currentConfig });
+              clipMaxTime = Math.max(clipMaxTime, timestamp - accumulatedTimeMicros + (chunk.duration ?? 0));
+
+              // Update progress
+              const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
+              const totalProgress = ((i + currentVideoProgress) / videos.length) * 90;
+              setProgress(Math.round(totalProgress));
+              setStatus(`Stitching video ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}% (Fast)`);
             }
-            lastDts = timestamp;
-
-            const data = new Uint8Array(chunk.byteLength);
-            chunk.copyTo(data);
-            const newChunk = new EncodedVideoChunk({
-              type: chunk.type,
-              timestamp: timestamp,
-              duration: chunk.duration ?? undefined,
-              data: data
-            });
-
-            muxer.addVideoChunk(newChunk, { decoderConfig: currentConfig });
-            clipMaxTime = Math.max(clipMaxTime, timestamp - accumulatedTimeMicros + (chunk.duration ?? 0));
-
-            // Update progress
-            const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
-            const totalProgress = ((i + currentVideoProgress) / videos.length) * 90;
-            setProgress(Math.round(totalProgress));
-            setStatus(`Stitching video ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}% (Fast)`);
+          } finally {
+            reader.releaseLock();
+            await stream.cancel();
           }
-          reader.releaseLock();
         } else {
           // Slow Path (Transcoding)
           let frameCount = 0;
@@ -393,19 +401,28 @@ function App() {
           const stream = demuxer.read('video');
           const reader = stream.getReader();
           
-          while (true) {
-            const { done, value: chunk } = await reader.read();
-            if (done) break;
-            
-            decoder.decode(chunk);
+          try {
+            while (true) {
+              const { done, value: chunk } = await reader.read();
+              if (done) break;
+              
+              // Decoder Backpressure Handling
+              if (decoder.decodeQueueSize > 5) {
+                await new Promise(r => setTimeout(r, 10));
+              }
 
-            // Update progress
-            const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
-            const totalProgress = ((i + currentVideoProgress) / videos.length) * 90;
-            setProgress(Math.round(totalProgress));
-            setStatus(`Stitching video ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
+              decoder.decode(chunk);
+
+              // Update progress
+              const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
+              const totalProgress = ((i + currentVideoProgress) / videos.length) * 90;
+              setProgress(Math.round(totalProgress));
+              setStatus(`Stitching video ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}%`);
+            }
+          } finally {
+            reader.releaseLock();
+            await stream.cancel();
           }
-          reader.releaseLock();
 
           await decoder.flush();
           decoder.close();
