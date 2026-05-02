@@ -193,13 +193,13 @@ function App() {
         codec: encoderCodec,
         width: targetWidth,
         height: targetHeight,
-        bitrate: 5_000_000, 
+        bitrate: 4_000_000, // Reduced from 5Mbps for better mobile performance/speed
         framerate: 30,
       };
       
       const optimizedEncoderConfig: VideoEncoderConfig = {
         ...baseEncoderConfig,
-        latencyMode: 'realtime',
+        latencyMode: 'realtime', // Keep low latency for faster pipeline flow
         hardwareAcceleration: 'prefer-hardware',
       };
 
@@ -235,6 +235,8 @@ function App() {
         }
 
         let clipMaxTime = 0;
+        let clipVideoOffset: number | null = null;
+        let clipAudioOffset: number | null = null;
 
         // Check compatibility
         const isCompatible = currentConfig.codec === targetCodec &&
@@ -257,7 +259,9 @@ function App() {
               const { done, value: chunk } = await audioReader.read();
               if (done) break;
 
-              let timestamp = chunk.timestamp + accumulatedTimeMicros;
+              if (clipAudioOffset === null) clipAudioOffset = chunk.timestamp;
+              let timestamp = (chunk.timestamp - clipAudioOffset) + accumulatedTimeMicros;
+              
               if (timestamp <= lastAudioDts) {
                 timestamp = lastAudioDts + 1;
               }
@@ -286,7 +290,9 @@ function App() {
             const { done, value: chunk } = await reader.read();
             if (done) break;
             
-            let timestamp = chunk.timestamp + accumulatedTimeMicros;
+            if (clipVideoOffset === null) clipVideoOffset = chunk.timestamp;
+            let timestamp = (chunk.timestamp - clipVideoOffset) + accumulatedTimeMicros;
+
             if (timestamp <= lastDts) {
               timestamp = lastDts + 1;
             }
@@ -302,7 +308,7 @@ function App() {
             });
 
             muxer.addVideoChunk(newChunk, { decoderConfig: currentConfig });
-            clipMaxTime = Math.max(clipMaxTime, chunk.timestamp + (chunk.duration ?? 0));
+            clipMaxTime = Math.max(clipMaxTime, timestamp - accumulatedTimeMicros + (chunk.duration ?? 0));
 
             // Update progress
             const currentVideoProgress = Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1);
@@ -315,9 +321,11 @@ function App() {
           let frameCount = 0;
           const decoder = new VideoDecoder({
             output: async (frame) => {
-              const timestampMicros = frame.timestamp + accumulatedTimeMicros;
+              if (clipVideoOffset === null) clipVideoOffset = frame.timestamp;
+              const timestampMicros = (frame.timestamp - clipVideoOffset) + accumulatedTimeMicros;
+              
               let frameToEncode: VideoFrame;
-              clipMaxTime = Math.max(clipMaxTime, frame.timestamp + (frame.duration ?? 0));
+              clipMaxTime = Math.max(clipMaxTime, timestampMicros - accumulatedTimeMicros + (frame.duration ?? 0));
 
               if (frame.displayWidth === targetWidth && frame.displayHeight === targetHeight) {
                 // Optimization: If dimensions match exactly, we can skip drawImage
@@ -363,7 +371,7 @@ function App() {
                 await new Promise(r => setTimeout(r, 10));
               }
 
-              encoder!.encode(frameToEncode, { keyFrame: frameCount % 60 === 0 });
+              encoder!.encode(frameToEncode, { keyFrame: frameCount % 120 === 0 });
               frameToEncode.close();
               frame.close();
               frameCount++;
