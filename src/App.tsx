@@ -241,9 +241,9 @@ function App() {
         let clipMaxTime = 0;
         let clipVideoOffset: number | null = null;
         let clipAudioOffset: number | null = null;
-
         // Check compatibility
-        const isCompatible = currentConfig.codec === targetCodec &&
+        const isCompatible = !(window as any).forceSlowPath && 
+          currentConfig.codec === targetCodec &&
           currentConfig.codedWidth === targetWidth &&
           currentConfig.codedHeight === targetHeight &&
           areBuffersEqual(currentConfig.description, targetDescription);
@@ -333,62 +333,69 @@ function App() {
         } else {
           // Slow Path (Transcoding)
           let frameCount = 0;
+          const pendingFrames: Promise<void>[] = [];
           const decoder = new VideoDecoder({
-            output: async (frame) => {
-              if (clipVideoOffset === null) clipVideoOffset = frame.timestamp;
-              const timestampMicros = (frame.timestamp - clipVideoOffset) + accumulatedTimeMicros;
-              
-              let frameToEncode: VideoFrame;
-              clipMaxTime = Math.max(clipMaxTime, timestampMicros - accumulatedTimeMicros + (frame.duration ?? 0));
+            output: (frame) => {
+              const frameTask = (async (f: VideoFrame) => {
+                try {
+                  if (clipVideoOffset === null) clipVideoOffset = f.timestamp;
+                  const timestampMicros = (f.timestamp - clipVideoOffset) + accumulatedTimeMicros;
+                  
+                  let frameToEncode: VideoFrame;
+                  clipMaxTime = Math.max(clipMaxTime, timestampMicros - accumulatedTimeMicros + (f.duration ?? 0));
 
-              if (frame.displayWidth === targetWidth && frame.displayHeight === targetHeight) {
-                // Optimization: If dimensions match exactly, we can skip drawImage
-                frameToEncode = new VideoFrame(frame, {
-                  timestamp: timestampMicros,
-                  duration: frame.duration || undefined
-                });
-              } else {
-                // Clear to black for pillarboxing/letterboxing
-                ctx.fillStyle = 'black';
-                ctx.fillRect(0, 0, targetWidth, targetHeight);
+                  if (f.displayWidth === targetWidth && f.displayHeight === targetHeight) {
+                    // Optimization: If dimensions match exactly, we can skip drawImage
+                    frameToEncode = new VideoFrame(f, {
+                      timestamp: timestampMicros,
+                      duration: f.duration || undefined
+                    });
+                  } else {
+                    // Clear to black for pillarboxing/letterboxing
+                    ctx.fillStyle = 'black';
+                    ctx.fillRect(0, 0, targetWidth, targetHeight);
 
-                const videoWidth = frame.displayWidth;
-                const videoHeight = frame.displayHeight;
-                const videoAspectRatio = videoWidth / videoHeight;
-                const targetAspectRatio = targetWidth / targetHeight;
+                    const videoWidth = f.displayWidth;
+                    const videoHeight = f.displayHeight;
+                    const videoAspectRatio = videoWidth / videoHeight;
+                    const targetAspectRatio = targetWidth / targetHeight;
 
-                let drawWidth = targetWidth;
-                let drawHeight = targetHeight;
-                let offsetX = 0;
-                let offsetY = 0;
+                    let drawWidth = targetWidth;
+                    let drawHeight = targetHeight;
+                    let offsetX = 0;
+                    let offsetY = 0;
 
-                if (videoAspectRatio > targetAspectRatio) {
-                  // Video is wider than target: letterbox
-                  drawHeight = targetWidth / videoAspectRatio;
-                  offsetY = (targetHeight - drawHeight) / 2;
-                } else {
-                  // Video is taller than target: pillarbox
-                  drawWidth = targetHeight * videoAspectRatio;
-                  offsetX = (targetWidth - drawWidth) / 2;
+                    if (videoAspectRatio > targetAspectRatio) {
+                      // Video is wider than target: letterbox
+                      drawHeight = targetWidth / videoAspectRatio;
+                      offsetY = (targetHeight - drawHeight) / 2;
+                    } else {
+                      // Video is taller than target: pillarbox
+                      drawWidth = targetHeight * videoAspectRatio;
+                      offsetX = (targetWidth - drawWidth) / 2;
+                    }
+
+                    ctx.drawImage(f, offsetX, offsetY, drawWidth, drawHeight);
+                    
+                    frameToEncode = new VideoFrame(canvas, {
+                      timestamp: timestampMicros,
+                      duration: f.duration || undefined
+                    });
+                  }
+                  
+                  // Encoder Backpressure Handling
+                  if (encoder!.encodeQueueSize > 20) {
+                    await new Promise(r => setTimeout(r, 10));
+                  }
+
+                  encoder!.encode(frameToEncode, { keyFrame: frameCount % 120 === 0 });
+                  frameToEncode.close();
+                  frameCount++;
+                } finally {
+                  f.close();
                 }
-
-                ctx.drawImage(frame, offsetX, offsetY, drawWidth, drawHeight);
-                
-                frameToEncode = new VideoFrame(canvas, {
-                  timestamp: timestampMicros,
-                  duration: frame.duration || undefined
-                });
-              }
-              
-              // Encoder Backpressure Handling
-              if (encoder!.encodeQueueSize > 20) {
-                await new Promise(r => setTimeout(r, 10));
-              }
-
-              encoder!.encode(frameToEncode, { keyFrame: frameCount % 120 === 0 });
-              frameToEncode.close();
-              frame.close();
-              frameCount++;
+              })(frame);
+              pendingFrames.push(frameTask);
             },
             error: (e) => {
               console.error('VideoDecoder error:', e);
@@ -425,6 +432,7 @@ function App() {
           }
 
           await decoder.flush();
+          await Promise.all(pendingFrames);
           decoder.close();
         }
 
