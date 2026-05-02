@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { Muxer, ArrayBufferTarget, type MuxerOptions } from 'mp4-muxer';
 import { WebDemuxer } from 'web-demuxer';
 import {
   DndContext,
@@ -146,15 +146,36 @@ function App() {
         throw new Error('Invalid video dimensions detected.');
       }
 
-      const muxer = new Muxer({
+      // Check for audio
+      let targetAudioConfig: AudioDecoderConfig | null = null;
+      try {
+        targetAudioConfig = await demuxer.getDecoderConfig('audio');
+      } catch {
+        // No audio track
+      }
+
+      const isHevc = targetCodec.startsWith('hev') || targetCodec.startsWith('hvc');
+      const muxerVideoCodec = isHevc ? 'hevc' : 'avc';
+
+      const muxerConfig: MuxerOptions<ArrayBufferTarget> = {
         target: new ArrayBufferTarget(),
         video: {
-          codec: 'avc',
+          codec: muxerVideoCodec,
           width: targetWidth,
           height: targetHeight
         },
         fastStart: 'in-memory'
-      });
+      };
+
+      if (targetAudioConfig) {
+        muxerConfig.audio = {
+          codec: targetAudioConfig.codec.startsWith('mp4a') ? 'aac' : 'opus',
+          sampleRate: targetAudioConfig.sampleRate,
+          numberOfChannels: targetAudioConfig.numberOfChannels
+        };
+      }
+
+      const muxer = new Muxer(muxerConfig);
 
       encoder = new VideoEncoder({
         output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
@@ -165,8 +186,11 @@ function App() {
       });
 
       // avc1.4d002a = Main Profile, Level 4.2 (supports 1080p @ 60fps)
+      // hev1.1.6.L120.90 = Main Profile, Level 4.0 (for HEVC)
+      const encoderCodec = isHevc ? 'hev1.1.6.L120.90' : 'avc1.4d002a';
+
       const baseEncoderConfig: VideoEncoderConfig = {
-        codec: 'avc1.4d002a',
+        codec: encoderCodec,
         width: targetWidth,
         height: targetHeight,
         bitrate: 5_000_000, 
@@ -192,6 +216,7 @@ function App() {
 
       let accumulatedTimeMicros = 0;
       let lastDts = -1;
+      let lastAudioDts = -1;
       const canvas = new OffscreenCanvas(targetWidth, targetHeight);
       const ctx = canvas.getContext('2d', { alpha: false })!;
 
@@ -202,6 +227,13 @@ function App() {
         const videoDuration = currentMediaInfo.duration;
         const currentConfig = await demuxer.getDecoderConfig('video');
         
+        let currentAudioConfig: AudioDecoderConfig | null = null;
+        try {
+          currentAudioConfig = await demuxer.getDecoderConfig('audio');
+        } catch {
+          // No audio
+        }
+
         let clipMaxTime = 0;
 
         // Check compatibility
@@ -209,6 +241,41 @@ function App() {
           currentConfig.codedWidth === targetWidth &&
           currentConfig.codedHeight === targetHeight &&
           areBuffersEqual(currentConfig.description, targetDescription);
+
+        // Remux audio if available and compatible
+        const remuxAudio = async () => {
+          if (
+            targetAudioConfig && 
+            currentAudioConfig && 
+            currentAudioConfig.codec === targetAudioConfig.codec &&
+            currentAudioConfig.sampleRate === targetAudioConfig.sampleRate &&
+            currentAudioConfig.numberOfChannels === targetAudioConfig.numberOfChannels
+          ) {
+            const audioStream = demuxer.read('audio');
+            const audioReader = audioStream.getReader();
+            while (true) {
+              const { done, value: chunk } = await audioReader.read();
+              if (done) break;
+
+              let timestamp = chunk.timestamp + accumulatedTimeMicros;
+              if (timestamp <= lastAudioDts) {
+                timestamp = lastAudioDts + 1;
+              }
+              lastAudioDts = timestamp;
+
+              const data = new Uint8Array(chunk.byteLength);
+              chunk.copyTo(data);
+              const newChunk = new EncodedAudioChunk({
+                type: chunk.type,
+                timestamp: timestamp,
+                duration: chunk.duration ?? undefined,
+                data: data
+              });
+
+              muxer.addAudioChunk(newChunk, { decoderConfig: currentAudioConfig });
+            }
+          }
+        };
 
         if (isCompatible) {
           // Fast Path (Remuxing)
@@ -247,7 +314,7 @@ function App() {
           // Slow Path (Transcoding)
           let frameCount = 0;
           const decoder = new VideoDecoder({
-            output: (frame) => {
+            output: async (frame) => {
               const timestampMicros = frame.timestamp + accumulatedTimeMicros;
               let frameToEncode: VideoFrame;
               clipMaxTime = Math.max(clipMaxTime, frame.timestamp + (frame.duration ?? 0));
@@ -291,6 +358,11 @@ function App() {
                 });
               }
               
+              // Encoder Backpressure Handling
+              if (encoder!.encodeQueueSize > 20) {
+                await new Promise(r => setTimeout(r, 10));
+              }
+
               encoder!.encode(frameToEncode, { keyFrame: frameCount % 60 === 0 });
               frameToEncode.close();
               frame.close();
@@ -323,6 +395,8 @@ function App() {
           await decoder.flush();
           decoder.close();
         }
+
+        await remuxAudio();
         
         accumulatedTimeMicros += Math.max(clipMaxTime, Math.round(videoDuration * 1_000_000));
       }
