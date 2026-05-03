@@ -90,8 +90,43 @@ function App() {
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
   const [isDone, setIsDone] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const addDebugLog = (msg: string) => {
+    setDebugLogs(prev => [...prev.slice(-19), `${new Date().toLocaleTimeString()}: ${msg}`]);
+  };
+
+  React.useEffect(() => {
+    const originalLog = console.log;
+    const originalError = console.error;
+    console.log = (...args) => {
+      addDebugLog(args.join(' '));
+      originalLog(...args);
+    };
+    console.error = (...args) => {
+      addDebugLog('ERROR: ' + args.join(' '));
+      originalError(...args);
+    };
+
+    const handleError = (e: ErrorEvent) => {
+      setError(`Global Error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}`);
+    };
+    const handleRejection = (e: PromiseRejectionEvent) => {
+      setError(`Unhandled Rejection: ${e.reason?.message || JSON.stringify(e.reason) || String(e.reason)}`);
+    };
+
+    window.addEventListener('error', handleError);
+    window.addEventListener('unhandledrejection', handleRejection);
+
+    return () => {
+      console.log = originalLog;
+      console.error = originalError;
+      window.removeEventListener('error', handleError);
+      window.removeEventListener('unhandledrejection', handleRejection);
+    };
+  }, []);
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -140,7 +175,10 @@ function App() {
   };
 
   const concatenate = async () => {
-    if (videos.length < 2) return;
+    if (videos.length < 2) {
+      setError('Please add at least 2 videos to stitch.');
+      return;
+    }
     setProcessing(true);
     setIsDone(false);
     setError(null);
@@ -152,10 +190,17 @@ function App() {
 
     try {
       setStatus('Initializing Engine...');
+      console.log('[Init] Checking WASM availability...');
+      const wasmUrl = new URL('/wasm-files/web-demuxer.wasm', window.location.origin);
+      const wasmCheck = await fetch(wasmUrl.href, { method: 'HEAD' });
+      if (!wasmCheck.ok) {
+        throw new Error(`WASM file not found at ${wasmUrl.href}. Status: ${wasmCheck.status}`);
+      }
+
       console.log('[Init] Loading first video to determine target resolution...');
       
       const initialDemuxer = new WebDemuxer({
-        wasmFilePath: new URL('/wasm-files/web-demuxer.wasm', window.location.origin).href
+        wasmFilePath: wasmUrl.href
       });
       
       let targetWidth: number;
@@ -220,6 +265,7 @@ function App() {
         }
       });
 
+      console.log('[Init] Checking encoder support...');
       const encoderCodec = isHevc ? 'hev1.1.6.L120.90' : 'avc1.4d002a';
       const baseEncoderConfig: VideoEncoderConfig = {
         codec: encoderCodec,
@@ -234,13 +280,20 @@ function App() {
         hardwareAcceleration: 'prefer-hardware',
       };
 
-      const support = await VideoEncoder.isConfigSupported(optimizedEncoderConfig);
-      if (support.supported) {
-        encoder.configure(optimizedEncoderConfig);
-      } else {
+      try {
+        const support = await VideoEncoder.isConfigSupported(optimizedEncoderConfig);
+        if (support.supported) {
+          encoder.configure(optimizedEncoderConfig);
+          console.log('[Init] Encoder configured (Optimized).');
+        } else {
+          encoder.configure(baseEncoderConfig);
+          console.log('[Init] Encoder configured (Base).');
+        }
+      } catch (configErr) {
+        console.warn('[Init] isConfigSupported failed, trying base config directly...', configErr);
         encoder.configure(baseEncoderConfig);
+        console.log('[Init] Encoder configured (Direct Base).');
       }
-      console.log('[Init] Encoder configured.');
 
       let accumulatedTimeMicros = 0;
       let lastDts = -1;
@@ -558,9 +611,18 @@ function App() {
       console.log('--- STITCH ENGINE COMPLETE ---');
     } catch (err) {
       console.error('[Engine] FATAL ERROR:', err);
-      const errorMessage = err instanceof Error 
-        ? `${err.name}: ${err.message}${err.stack ? '\n' + err.stack.split('\n').slice(0, 3).join('\n') : ''}`
-        : 'An unexpected error occurred.';
+      let errorMessage: string;
+      if (err instanceof Error) {
+        errorMessage = `${err.name}: ${err.message}${err.stack ? '\n' + err.stack.split('\n').slice(0, 3).join('\n') : ''}`;
+      } else if (typeof err === 'string') {
+        errorMessage = `Error string: ${err}`;
+      } else {
+        try {
+          errorMessage = `Unexpected error object: ${JSON.stringify(err)}`;
+        } catch {
+          errorMessage = `Unexpected error (non-serializable): ${String(err)}`;
+        }
+      }
       setError(errorMessage);
     } finally {
       setProcessing(false);
@@ -604,13 +666,46 @@ function App() {
       </div>
 
       {error && (
-        <div className={styles.errorBanner}>
-          <AlertTriangle size={20} />
-          <span>{error}</span>
-          <button onClick={() => setError(null)} className={styles.closeError}>
-            <X size={16} />
-          </button>
-        </div>
+        <>
+          <div className={styles.errorBanner}>
+            <AlertTriangle size={20} />
+            <span style={{ whiteSpace: 'pre-wrap' }}>{error}</span>
+            <button onClick={() => setError(null)} className={styles.closeError}>
+              <X size={16} />
+            </button>
+            <button 
+              onClick={() => window.location.reload()} 
+              style={{ 
+                marginLeft: '0.5rem', 
+                background: '#991b1b', 
+                color: 'white', 
+                border: 'none', 
+                padding: '0.25rem 0.5rem', 
+                borderRadius: '0.25rem', 
+                fontSize: '0.75rem', 
+                cursor: 'pointer' 
+              }}
+            >
+              Reload Page
+            </button>
+          </div>
+          {debugLogs.length > 0 && (
+            <div style={{ 
+              background: '#1e293b', 
+              color: '#38bdf8', 
+              padding: '1rem', 
+              borderRadius: '0.5rem', 
+              fontSize: '0.75rem', 
+              fontFamily: 'monospace',
+              maxHeight: '200px',
+              overflowY: 'auto',
+              marginBottom: '1.5rem'
+            }}>
+              <div style={{ fontWeight: 'bold', marginBottom: '0.5rem', borderBottom: '1px solid #334155' }}>Debug Logs:</div>
+              {debugLogs.map((log, i) => <div key={i}>{log}</div>)}
+            </div>
+          )}
+        </>
       )}
 
       {!processing && !isDone && (
