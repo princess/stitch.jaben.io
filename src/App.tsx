@@ -388,19 +388,12 @@ function App() {
               console.log(`[Clip ${i + 1}] Video: Fast Path`);
               const stream = demuxer.read('video');
               const reader = stream.getReader();
+              let batchStartTime = performance.now();
               try {
                 while (true) {
                   if (error) throw new Error(error);
                   
-                  let result;
-                  try {
-                    result = await readWithTimeout(reader);
-                  } catch (readErr) {
-                    console.error(`[Clip ${i+1}] Video Stream Read Error at chunk ${chunkCount}:`, readErr);
-                    throw readErr;
-                  }
-                  
-                  const { done, value: chunk } = result;
+                  const { done, value: chunk } = await reader.read();
                   if (done) {
                     console.log(`[Clip ${i+1}] Video: Reached end of stream. Chunks: ${chunkCount}`);
                     break;
@@ -408,7 +401,6 @@ function App() {
                   
                   if (clipVideoOffset === null) {
                     clipVideoOffset = chunk.timestamp;
-                    console.log(`[Clip ${i+1}] Video: First chunk timestamp: ${clipVideoOffset}`);
                   }
                   
                   let timestamp = (chunk.timestamp - clipVideoOffset!) + accumulatedTimeMicros;
@@ -419,15 +411,14 @@ function App() {
                   chunk.copyTo(data);
                   
                   try {
-                    const encodedChunk = new EncodedVideoChunk({
+                    muxer!.addVideoChunk(new EncodedVideoChunk({
                       type: chunk.type,
                       timestamp,
                       duration: chunk.duration ?? undefined,
                       data
-                    });
-                    muxer!.addVideoChunk(encodedChunk, { decoderConfig: currentConfig });
+                    }), { decoderConfig: currentConfig });
                   } catch (muxErr) {
-                    console.error('[Muxer] Video chunk error at chunk', chunkCount, 'timestamp', timestamp, 'type', chunk.type, 'dataLength', data.length, muxErr);
+                    console.error('[Muxer] Video chunk error', muxErr);
                     throw muxErr;
                   }
 
@@ -435,7 +426,10 @@ function App() {
                   
                   chunkCount++;
                   if (chunkCount % 100 === 0) {
-                    console.log(`[Clip ${i+1}] Video: Processed ${chunkCount} chunks. Last TS: ${timestamp}`);
+                    const now = performance.now();
+                    console.log(`[Clip ${i+1}] Video: 100 chunks in ${Math.round(now - batchStartTime)}ms. Total: ${chunkCount}`);
+                    batchStartTime = now;
+
                     const currentVideoProgress = videoDuration > 0 ? Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1) : 0;
                     const totalProgress = Math.round(((i + currentVideoProgress) / videos.length) * 90);
                     setProgress(totalProgress);
@@ -593,19 +587,12 @@ function App() {
               const audioStream = demuxer.read('audio');
               const audioReader = audioStream.getReader();
               let audioChunkCount = 0;
+              let batchStartTime = performance.now();
               try {
                 while (true) {
                   if (error) throw new Error(error);
                   
-                  let result;
-                  try {
-                    result = await readWithTimeout(audioReader);
-                  } catch (readErr) {
-                    console.error(`[Clip ${i+1}] Audio Stream Read Error at chunk ${audioChunkCount}:`, readErr);
-                    throw readErr;
-                  }
-                  
-                  const { done, value: chunk } = result;
+                  const { done, value: chunk } = await audioReader.read();
                   if (done) {
                     console.log(`[Clip ${i+1}] Audio: Reached end of stream. Chunks: ${audioChunkCount}`);
                     break;
@@ -613,7 +600,6 @@ function App() {
 
                   if (clipAudioOffset === null) {
                     clipAudioOffset = chunk.timestamp;
-                    console.log(`[Clip ${i+1}] Audio: First chunk timestamp: ${clipAudioOffset}`);
                   }
                   
                   let timestamp = (chunk.timestamp - clipAudioOffset!) + accumulatedTimeMicros;
@@ -623,21 +609,22 @@ function App() {
                   chunk.copyTo(data);
                   
                   try {
-                    const encodedChunk = new EncodedAudioChunk({
+                    muxer!.addAudioChunk(new EncodedAudioChunk({
                       type: chunk.type,
                       timestamp,
                       duration: chunk.duration ?? undefined,
                       data
-                    });
-                    muxer!.addAudioChunk(encodedChunk, { decoderConfig: currentAudioConfig });
+                    }), { decoderConfig: currentAudioConfig });
                   } catch (muxErr) {
-                    console.error('[Muxer] Audio chunk error at timestamp', timestamp, 'type', chunk.type, 'dataLength', data.length, muxErr);
+                    console.error('[Muxer] Audio chunk error', muxErr);
                     throw muxErr;
                   }
                   
                   audioChunkCount++;
                   if (audioChunkCount % 100 === 0) {
-                    console.log(`[Clip ${i+1}] Audio: Processed ${audioChunkCount} chunks. Last TS: ${timestamp}`);
+                    const now = performance.now();
+                    console.log(`[Clip ${i+1}] Audio: 100 chunks in ${Math.round(now - batchStartTime)}ms. Total: ${audioChunkCount}`);
+                    batchStartTime = now;
                   }
                 }
               } finally {
