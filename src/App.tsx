@@ -101,12 +101,24 @@ function App() {
   React.useEffect(() => {
     const originalLog = console.log;
     const originalError = console.error;
+    
+    const stringifyArgs = (args: any[]) => {
+      return args.map(arg => {
+        if (arg instanceof Error) return `${arg.name}: ${arg.message}`;
+        if (arg instanceof DOMException) return `DOMException: ${arg.name} - ${arg.message}`;
+        if (typeof arg === 'object') {
+          try { return JSON.stringify(arg); } catch { return String(arg); }
+        }
+        return String(arg);
+      }).join(' ');
+    };
+
     console.log = (...args) => {
-      addDebugLog(args.join(' '));
+      addDebugLog(stringifyArgs(args));
       originalLog(...args);
     };
     console.error = (...args) => {
-      addDebugLog('ERROR: ' + args.join(' '));
+      addDebugLog('ERROR: ' + stringifyArgs(args));
       originalError(...args);
     };
 
@@ -377,14 +389,15 @@ function App() {
                   chunk.copyTo(data);
                   
                   try {
-                    muxer!.addVideoChunk(new EncodedVideoChunk({
+                    const encodedChunk = new EncodedVideoChunk({
                       type: chunk.type,
                       timestamp,
                       duration: chunk.duration ?? undefined,
                       data
-                    }), { decoderConfig: currentConfig });
+                    });
+                    muxer!.addVideoChunk(encodedChunk, { decoderConfig: currentConfig });
                   } catch (muxErr) {
-                    console.error('[Muxer] Video chunk error:', muxErr);
+                    console.error('[Muxer] Video chunk error at chunk', chunkCount, 'timestamp', timestamp, 'type', chunk.type, 'dataLength', data.length, muxErr);
                     throw muxErr;
                   }
 
@@ -562,14 +575,15 @@ function App() {
                   chunk.copyTo(data);
                   
                   try {
-                    muxer!.addAudioChunk(new EncodedAudioChunk({
+                    const encodedChunk = new EncodedAudioChunk({
                       type: chunk.type,
                       timestamp,
                       duration: chunk.duration ?? undefined,
                       data
-                    }), { decoderConfig: currentAudioConfig });
+                    });
+                    muxer!.addAudioChunk(encodedChunk, { decoderConfig: currentAudioConfig });
                   } catch (muxErr) {
-                    console.error('[Muxer] Audio chunk error:', muxErr);
+                    console.error('[Muxer] Audio chunk error at timestamp', timestamp, 'type', chunk.type, 'dataLength', data.length, muxErr);
                     throw muxErr;
                   }
                 }
