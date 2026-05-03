@@ -370,17 +370,35 @@ function App() {
           let clipAudioOffset: number | null = null;
 
           const processVideo = async () => {
+            console.log(`[Clip ${i + 1}] Starting Video Process...`);
             let chunkCount = 0;
             if (isCompatible) {
+              console.log(`[Clip ${i + 1}] Video: Fast Path`);
               const stream = demuxer.read('video');
               const reader = stream.getReader();
               try {
                 while (true) {
                   if (error) throw new Error(error);
-                  const { done, value: chunk } = await readWithTimeout(reader);
-                  if (done) break;
                   
-                  if (clipVideoOffset === null) clipVideoOffset = chunk.timestamp;
+                  let result;
+                  try {
+                    result = await readWithTimeout(reader);
+                  } catch (readErr) {
+                    console.error(`[Clip ${i+1}] Video Stream Read Error at chunk ${chunkCount}:`, readErr);
+                    throw readErr;
+                  }
+                  
+                  const { done, value: chunk } = result;
+                  if (done) {
+                    console.log(`[Clip ${i+1}] Video: Reached end of stream. Chunks: ${chunkCount}`);
+                    break;
+                  }
+                  
+                  if (clipVideoOffset === null) {
+                    clipVideoOffset = chunk.timestamp;
+                    console.log(`[Clip ${i+1}] Video: First chunk timestamp: ${clipVideoOffset}`);
+                  }
+                  
                   let timestamp = (chunk.timestamp - clipVideoOffset!) + accumulatedTimeMicros;
                   if (timestamp <= lastDts) timestamp = lastDts + 1;
                   lastDts = timestamp;
@@ -404,11 +422,11 @@ function App() {
                   clipMaxTime = Math.max(clipMaxTime, timestamp - accumulatedTimeMicros + (chunk.duration ?? 0));
                   
                   chunkCount++;
-                  if (chunkCount % 50 === 0) {
+                  if (chunkCount % 100 === 0) {
+                    console.log(`[Clip ${i+1}] Video: Processed ${chunkCount} chunks. Last TS: ${timestamp}`);
                     const currentVideoProgress = videoDuration > 0 ? Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1) : 0;
                     const totalProgress = Math.round(((i + currentVideoProgress) / videos.length) * 90);
                     setProgress(totalProgress);
-                    setStatus(`Stitching ${i + 1}/${videos.length}: ${Math.round(currentVideoProgress * 100)}% (Fast)`);
                   }
                 }
               } finally {
@@ -416,6 +434,7 @@ function App() {
                 await stream.cancel();
               }
             } else {
+              console.log(`[Clip ${i + 1}] Video: Slow Path`);
               const clipContext = {
                 encodingPromise: Promise.resolve(),
                 clipVideoOffset: null as number | null,
@@ -557,17 +576,34 @@ function App() {
                 currentAudioConfig.codec === targetAudioConfig.codec &&
                 currentAudioConfig.sampleRate === targetAudioConfig.sampleRate &&
                 currentAudioConfig.numberOfChannels === targetAudioConfig.numberOfChannels) {
-              console.log(`[Clip ${i + 1}] Audio compatible. Remuxing...`);
+              console.log(`[Clip ${i + 1}] Starting Audio Process (Fast Path)...`);
               
               const audioStream = demuxer.read('audio');
               const audioReader = audioStream.getReader();
+              let audioChunkCount = 0;
               try {
                 while (true) {
                   if (error) throw new Error(error);
-                  const { done, value: chunk } = await readWithTimeout(audioReader);
-                  if (done) break;
+                  
+                  let result;
+                  try {
+                    result = await readWithTimeout(audioReader);
+                  } catch (readErr) {
+                    console.error(`[Clip ${i+1}] Audio Stream Read Error at chunk ${audioChunkCount}:`, readErr);
+                    throw readErr;
+                  }
+                  
+                  const { done, value: chunk } = result;
+                  if (done) {
+                    console.log(`[Clip ${i+1}] Audio: Reached end of stream. Chunks: ${audioChunkCount}`);
+                    break;
+                  }
 
-                  if (clipAudioOffset === null) clipAudioOffset = chunk.timestamp;
+                  if (clipAudioOffset === null) {
+                    clipAudioOffset = chunk.timestamp;
+                    console.log(`[Clip ${i+1}] Audio: First chunk timestamp: ${clipAudioOffset}`);
+                  }
+                  
                   let timestamp = (chunk.timestamp - clipAudioOffset!) + accumulatedTimeMicros;
                   if (timestamp <= lastAudioDts) timestamp = lastAudioDts + 1;
                   lastAudioDts = timestamp;
@@ -586,15 +622,24 @@ function App() {
                     console.error('[Muxer] Audio chunk error at timestamp', timestamp, 'type', chunk.type, 'dataLength', data.length, muxErr);
                     throw muxErr;
                   }
+                  
+                  audioChunkCount++;
+                  if (audioChunkCount % 100 === 0) {
+                    console.log(`[Clip ${i+1}] Audio: Processed ${audioChunkCount} chunks. Last TS: ${timestamp}`);
+                  }
                 }
               } finally {
                 audioReader.releaseLock();
                 await audioStream.cancel();
               }
+            } else {
+              console.log(`[Clip ${i + 1}] Audio: Incompatible or missing. Skipping remux.`);
             }
           };
 
-          await Promise.all([processVideo(), processAudio()]);
+          // Process Video then Audio to get clearer logs
+          await processVideo();
+          await processAudio();
 
           accumulatedTimeMicros += Math.max(clipMaxTime, Math.round(videoDuration * 1_000_000));
           console.log(`[Clip ${i + 1}] DONE. Accumulated Time: ${accumulatedTimeMicros}us`);
