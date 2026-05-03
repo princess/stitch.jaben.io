@@ -2,7 +2,9 @@ import React, { useState, useRef } from 'react';
 import { Muxer, ArrayBufferTarget, type MuxerOptions } from 'mp4-muxer';
 import { WebDemuxer } from 'web-demuxer';
 
+ 
 if (typeof window !== 'undefined') {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (window as any).WebDemuxer = WebDemuxer;
 }
 
@@ -30,8 +32,10 @@ import styles from './App.module.css';
 const areBuffersEqual = (a: AllowSharedBufferSource | undefined, b: AllowSharedBufferSource | undefined) => {
   if (a === b) return true;
   if (!a || !b) return false;
-  const viewA = new Uint8Array(a instanceof ArrayBuffer || a instanceof SharedArrayBuffer ? a : a.buffer);
-  const viewB = new Uint8Array(b instanceof ArrayBuffer || b instanceof SharedArrayBuffer ? b : b.buffer);
+  const isSharedA = typeof SharedArrayBuffer !== 'undefined' && a instanceof SharedArrayBuffer;
+  const isSharedB = typeof SharedArrayBuffer !== 'undefined' && b instanceof SharedArrayBuffer;
+  const viewA = new Uint8Array(a instanceof ArrayBuffer || isSharedA ? (a as ArrayBuffer | SharedArrayBuffer) : (a as ArrayBufferView).buffer);
+  const viewB = new Uint8Array(b instanceof ArrayBuffer || isSharedB ? (b as ArrayBuffer | SharedArrayBuffer) : (b as ArrayBufferView).buffer);
   if (viewA.length !== viewB.length) return false;
   for (let i = 0; i < viewA.length; i++) {
     if (viewA[i] !== viewB[i]) return false;
@@ -97,7 +101,7 @@ function App() {
   );
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
+    if (e.target.files && e.target.files.length > 0) {
       const newFiles = Array.from(e.target.files).map(file => ({
         id: Math.random().toString(36).substr(2, 9),
         file
@@ -105,6 +109,8 @@ function App() {
       setVideos(prev => [...prev, ...newFiles]);
       setIsDone(false);
       setError(null);
+      // Clear the input value so the same file can be selected again
+      e.target.value = '';
     }
   };
 
@@ -244,10 +250,10 @@ function App() {
       if (!ctx) throw new Error('Failed to initialize 2D context.');
 
       // Watchdog helper to prevent silent hangs in stream reading
-      const readWithTimeout = async (reader: ReadableStreamDefaultReader<any>, timeoutMs = 10000) => {
+      const readWithTimeout = async <T,>(reader: ReadableStreamDefaultReader<T>, timeoutMs = 10000) => {
         return Promise.race([
           reader.read(),
-          new Promise<never>((_, reject) => 
+          new Promise<ReadableStreamReadResult<T>>((_, reject) => 
             setTimeout(() => reject(new Error('Stream read timed out (possible file corruption).')), timeoutMs)
           )
         ]);
@@ -275,7 +281,7 @@ function App() {
             currentAudioConfig = await demuxer.getDecoderConfig('audio');
           } catch { /* No audio */ }
 
-          const isCompatible = !(window as any).forceSlowPath && 
+          const isCompatible = !(window as unknown as { forceSlowPath?: boolean }).forceSlowPath && 
             currentConfig.codec === targetCodec &&
             currentConfig.codedWidth === targetWidth &&
             currentConfig.codedHeight === targetHeight &&
@@ -384,7 +390,7 @@ function App() {
                       
                       // Encoder Backpressure Handling with safety timeout
                       if (encoder!.encodeQueueSize > 128) {
-                        let waitStart = Date.now();
+                        const waitStart = Date.now();
                         while (encoder!.encodeQueueSize > 128) {
                           await new Promise(r => setTimeout(r, 0));
                           if (Date.now() - waitStart > 5000) {
@@ -487,7 +493,6 @@ function App() {
               
               const audioStream = demuxer.read('audio');
               const audioReader = audioStream.getReader();
-              let audioChunkCount = 0;
               try {
                 while (true) {
                   if (error) throw new Error(error);
@@ -512,8 +517,6 @@ function App() {
                     console.error('[Muxer] Audio chunk error:', muxErr);
                     throw muxErr;
                   }
-
-                  audioChunkCount++;
                 }
               } finally {
                 audioReader.releaseLock();
