@@ -91,11 +91,12 @@ function App() {
   const [status, setStatus] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
+  const [showDebug, setShowDebug] = useState(false);
   const [isDone, setIsDone] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const addDebugLog = (msg: string) => {
-    setDebugLogs(prev => [...prev.slice(-19), `${new Date().toLocaleTimeString()}: ${msg}`]);
+    setDebugLogs(prev => [...prev.slice(-29), `${new Date().toLocaleTimeString()}: ${msg}`]);
   };
 
   React.useEffect(() => {
@@ -348,13 +349,24 @@ function App() {
             currentAudioConfig = await demuxer.getDecoderConfig('audio');
           } catch { /* No audio */ }
 
-          const isCompatible = !(window as unknown as { forceSlowPath?: boolean }).forceSlowPath && 
-            currentConfig.codec === targetCodec &&
-            currentConfig.codedWidth === targetWidth &&
-            currentConfig.codedHeight === targetHeight &&
-            areBuffersEqual(currentConfig.description, targetDescription);
+          const forceSlow = (window as unknown as { forceSlowPath?: boolean }).forceSlowPath;
+          const codecMatch = currentConfig.codec === targetCodec;
+          const widthMatch = currentConfig.codedWidth === targetWidth;
+          const heightMatch = currentConfig.codedHeight === targetHeight;
+          const descMatch = areBuffersEqual(currentConfig.description, targetDescription);
 
-          console.log(`[Clip ${i + 1}] Compatibility Check: ${isCompatible ? 'FAST PATH (Remux)' : 'SLOW PATH (Transcode)'}`);
+          const isCompatible = !forceSlow && codecMatch && widthMatch && heightMatch && descMatch;
+
+          console.log(`[Clip ${i + 1}] Compatibility Check: ${isCompatible ? 'FAST PATH' : 'SLOW PATH'}`);
+          if (!isCompatible) {
+            console.log(`[Clip ${i + 1}] Reasons for SLOW PATH:`, {
+              forceSlow,
+              codecMatch: `${currentConfig.codec} vs ${targetCodec}`,
+              widthMatch: `${currentConfig.codedWidth} vs ${targetWidth}`,
+              heightMatch: `${currentConfig.codedHeight} vs ${targetHeight}`,
+              descMatch
+            });
+          }
 
           if (i > 0) {
             console.log(`[Clip ${i + 1}] Transitioning... Hardening hardware state.`);
@@ -725,30 +737,48 @@ function App() {
       </div>
 
       {error && (
-        <>
-          <div className={styles.errorBanner}>
-            <AlertTriangle size={20} />
-            <span style={{ whiteSpace: 'pre-wrap' }}>{error}</span>
-            <button onClick={() => setError(null)} className={styles.closeError}>
-              <X size={16} />
-            </button>
-            <button 
-              onClick={() => window.location.reload()} 
-              style={{ 
-                marginLeft: '0.5rem', 
-                background: '#991b1b', 
-                color: 'white', 
-                border: 'none', 
-                padding: '0.25rem 0.5rem', 
-                borderRadius: '0.25rem', 
-                fontSize: '0.75rem', 
-                cursor: 'pointer' 
-              }}
-            >
-              Reload Page
-            </button>
-          </div>
-          {debugLogs.length > 0 && (
+        <div className={styles.errorBanner}>
+          <AlertTriangle size={20} />
+          <span style={{ whiteSpace: 'pre-wrap' }}>{error}</span>
+          <button onClick={() => setError(null)} className={styles.closeError}>
+            <X size={16} />
+          </button>
+          <button 
+            onClick={() => window.location.reload()} 
+            style={{ 
+              marginLeft: '0.5rem', 
+              background: '#991b1b', 
+              color: 'white', 
+              border: 'none', 
+              padding: '0.25rem 0.5rem', 
+              borderRadius: '0.25rem', 
+              fontSize: '0.75rem', 
+              cursor: 'pointer' 
+            }}
+          >
+            Reload Page
+          </button>
+        </div>
+      )}
+
+      {(processing || error || debugLogs.length > 0) && (
+        <div style={{ marginBottom: '1.5rem' }}>
+          <button 
+            onClick={() => setShowDebug(!showDebug)}
+            style={{ 
+              background: 'none', 
+              border: 'none', 
+              color: '#64748b', 
+              fontSize: '0.75rem', 
+              textDecoration: 'underline',
+              cursor: 'pointer',
+              marginBottom: '0.5rem'
+            }}
+          >
+            {showDebug ? 'Hide Debug Logs' : 'Show Debug Logs'}
+          </button>
+          
+          {showDebug && (
             <div style={{ 
               background: '#1e293b', 
               color: '#38bdf8', 
@@ -756,15 +786,14 @@ function App() {
               borderRadius: '0.5rem', 
               fontSize: '0.75rem', 
               fontFamily: 'monospace',
-              maxHeight: '200px',
-              overflowY: 'auto',
-              marginBottom: '1.5rem'
+              maxHeight: '250px',
+              overflowY: 'auto'
             }}>
               <div style={{ fontWeight: 'bold', marginBottom: '0.5rem', borderBottom: '1px solid #334155' }}>Debug Logs:</div>
               {debugLogs.map((log, i) => <div key={i}>{log}</div>)}
             </div>
           )}
-        </>
+        </div>
       )}
 
       {!processing && !isDone && (
