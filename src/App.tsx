@@ -155,7 +155,7 @@ function App() {
       console.log('[Init] Loading first video to determine target resolution...');
       
       const initialDemuxer = new WebDemuxer({
-        wasmFilePath: `${window.location.origin}/wasm-files/web-demuxer.wasm`
+        wasmFilePath: new URL('/wasm-files/web-demuxer.wasm', window.location.origin).href
       });
       
       let targetWidth: number;
@@ -166,6 +166,7 @@ function App() {
 
       try {
         await initialDemuxer.load(videos[0].file);
+        
         const targetConfig = await initialDemuxer.getDecoderConfig('video');
         targetWidth = targetConfig.codedWidth!;
         targetHeight = targetConfig.codedHeight!;
@@ -264,15 +265,16 @@ function App() {
         console.log(`[Clip ${i + 1}/${videos.length}] --- STARTING CLIP: ${videoFile.name} ---`);
         
         const demuxer = new WebDemuxer({
-          wasmFilePath: `${window.location.origin}/wasm-files/web-demuxer.wasm`
+          wasmFilePath: new URL('/wasm-files/web-demuxer.wasm', window.location.origin).href
         });
 
         try {
           setStatus(`Loading clip ${i + 1}/${videos.length}...`);
           await demuxer.load(videoFile);
+          
+          const currentConfig = await demuxer.getDecoderConfig('video');
           const currentMediaInfo = await demuxer.getMediaInfo();
           const videoDuration = currentMediaInfo.duration;
-          const currentConfig = await demuxer.getDecoderConfig('video');
           
           console.log(`[Clip ${i + 1}] Duration: ${videoDuration}s, Config: ${currentConfig.codedWidth}x${currentConfig.codedHeight} ${currentConfig.codec}`);
 
@@ -556,7 +558,10 @@ function App() {
       console.log('--- STITCH ENGINE COMPLETE ---');
     } catch (err) {
       console.error('[Engine] FATAL ERROR:', err);
-      setError(err instanceof Error ? err.message : 'An unexpected error occurred.');
+      const errorMessage = err instanceof Error 
+        ? `${err.name}: ${err.message}${err.stack ? '\n' + err.stack.split('\n').slice(0, 3).join('\n') : ''}`
+        : 'An unexpected error occurred.';
+      setError(errorMessage);
     } finally {
       setProcessing(false);
       if (encoder && encoder.state !== 'closed') encoder.close();

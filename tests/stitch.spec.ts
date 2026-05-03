@@ -41,8 +41,9 @@ test('should stitch two videos together (fast path)', async ({ page }) => {
   // Wait for success message or error banner
   await Promise.race([
     expect(page.locator('text=Successfully Stitched!')).toBeVisible({ timeout: 120000 }),
-    expect(page.locator('div[class*="errorBanner"]')).toBeVisible({ timeout: 120000 }).then(() => {
-      throw new Error('Stitching failed with error banner');
+    expect(page.locator('div[class*="errorBanner"]')).toBeVisible({ timeout: 120000 }).then(async () => {
+      const errorText = await page.locator('div[class*="errorBanner"] span').innerText();
+      throw new Error(`Stitching failed with error: ${errorText}`);
     })
   ]);
 
