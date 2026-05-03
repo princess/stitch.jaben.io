@@ -636,9 +636,9 @@ function App() {
             }
           };
 
-          // Process Video then Audio to get clearer logs
-          await processVideo();
-          await processAudio();
+          // Process Video and Audio in parallel for maximum speed
+          console.log(`[Clip ${i + 1}] Starting Parallel A/V Process...`);
+          await Promise.all([processVideo(), processAudio()]);
 
           accumulatedTimeMicros += Math.max(clipMaxTime, Math.round(videoDuration * 1_000_000));
           console.log(`[Clip ${i + 1}] DONE. Accumulated Time: ${accumulatedTimeMicros}us`);
@@ -672,6 +672,8 @@ function App() {
       let errorMessage: string;
       if (err instanceof Error) {
         errorMessage = `${err.name}: ${err.message}${err.stack ? '\n' + err.stack.split('\n').slice(0, 3).join('\n') : ''}`;
+      } else if (err instanceof DOMException) {
+        errorMessage = `DOMException: ${err.name} - ${err.message}`;
       } else if (typeof err === 'string') {
         errorMessage = `Error string: ${err}`;
       } else {
@@ -757,7 +759,7 @@ function App() {
               border: 'none', 
               color: '#64748b', 
               fontSize: '0.75rem', 
-              textDecoration: 'underline',
+              textDecoration: 'underline', 
               cursor: 'pointer',
               marginBottom: '0.5rem'
             }}
