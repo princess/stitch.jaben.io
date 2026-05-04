@@ -79,7 +79,7 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const addDebugLog = (msg: string) => {
-    setDebugLogs(prev => [...prev.slice(-29), `${new Date().toLocaleTimeString()}: ${msg}`]);
+    setDebugLogs(prev => [...prev.slice(-39), `${new Date().toLocaleTimeString()}: ${msg}`]);
   };
 
   React.useEffect(() => {
@@ -169,23 +169,25 @@ function App() {
     setError(null);
   };
 
-  const concatenate = async () => {
+  const concatenate = async (forceSafe = false) => {
     if (videos.length < 2) {
       setError('Please add at least 2 videos to stitch.');
       return;
     }
     setProcessing(true);
-    setIsDone(false);
-    setError(null);
-    setProgress(0);
+    if (!forceSafe) {
+      setIsDone(false);
+      setError(null);
+      setProgress(0);
+    }
 
-    console.log('--- UNIVERSAL STITCH ENGINE STARTING ---');
+    console.log(`--- UNIVERSAL STITCH ENGINE STARTING (Safe: ${forceSafe}) ---`);
     let encoder: VideoEncoder | null = null;
     let audioEncoder: AudioEncoder | null = null;
     let muxer: Muxer<ArrayBufferTarget> | null = null;
 
     try {
-      setStatus('Initializing Engine...');
+      setStatus(forceSafe ? 'Retrying in Compatibility Mode...' : 'Initializing Engine...');
       const wasmUrl = new URL('/wasm-files/web-demuxer.wasm', window.location.origin).href;
       
       const initialDemuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
@@ -212,10 +214,13 @@ function App() {
       }
 
       // Output Muxer
+      // FORCE H.264 in Safe Mode for maximum compatibility
+      const finalCodec = forceSafe ? 'avc' : ((targetCodec.startsWith('hev') || targetCodec.startsWith('hvc')) ? 'hevc' : 'avc');
+      
       muxer = new Muxer({
         target: new ArrayBufferTarget(),
         video: {
-          codec: (targetCodec.startsWith('hev') || targetCodec.startsWith('hvc')) ? 'hevc' : 'avc',
+          codec: finalCodec,
           width: targetWidth,
           height: targetHeight
         },
@@ -230,18 +235,32 @@ function App() {
       // Video Encoder
       encoder = new VideoEncoder({
         output: (chunk, meta) => muxer!.addVideoChunk(chunk, meta),
-        error: (e) => setError(`Encoder Error: ${e.message}`)
+        error: (e) => {
+          console.error('[Encoder] Callback Error:', e);
+          throw e; // Bubble up to trigger retry
+        }
       });
+
       const vEncoderConfig: VideoEncoderConfig = {
-        codec: (targetCodec.startsWith('hev') || targetCodec.startsWith('hvc')) ? 'hev1.1.6.L120.90' : 'avc1.4d002a',
+        // Safe mode uses standard AVC profile
+        codec: finalCodec === 'hevc' ? 'hev1.1.6.L120.90' : 'avc1.42E01E',
         width: targetWidth,
         height: targetHeight,
         bitrate: 5_000_000,
         framerate: 30,
-        hardwareAcceleration: 'prefer-hardware'
+        hardwareAcceleration: forceSafe ? 'prefer-software' : 'prefer-hardware'
       };
+
+      console.log('[Init] VideoEncoder Config:', vEncoderConfig);
       const vSupport = await VideoEncoder.isConfigSupported(vEncoderConfig);
-      encoder.configure(vSupport.supported ? vEncoderConfig : { ...vEncoderConfig, hardwareAcceleration: 'prefer-software' });
+      console.log('[Init] VideoEncoder Support:', vSupport);
+      
+      try {
+        encoder.configure(vSupport.supported ? vEncoderConfig : { ...vEncoderConfig, hardwareAcceleration: 'prefer-software' });
+      } catch (confErr: any) {
+        console.error('[Init] VideoEncoder.configure FAILED:', confErr);
+        throw confErr;
+      }
 
       // Audio Encoder
       if (targetAudioConfig) {
@@ -269,7 +288,10 @@ function App() {
         const demuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
 
         try {
-          setStatus(`Stitching clip ${i + 1}/${videos.length}...`);
+          setStatus(forceSafe 
+            ? `Retrying ${i + 1}/${videos.length} (Compatibility Mode)...` 
+            : `Stitching clip ${i + 1}/${videos.length}...`
+          );
           await demuxer.load(videoFile);
           const currentConfig = await demuxer.getDecoderConfig('video');
           const mediaInfo = await demuxer.getMediaInfo();
@@ -287,6 +309,7 @@ function App() {
             let clipVideoOffset: number | null = null;
             let frameCount = 0;
 
+            console.log(`[Clip ${i+1}] VideoDecoder Config:`, currentConfig);
             const decoder = new VideoDecoder({
               output: (frame) => {
                 if (clipVideoOffset === null) clipVideoOffset = frame.timestamp;
@@ -318,10 +341,19 @@ function App() {
                 frameToEncode.close();
                 frame.close();
               },
-              error: (e) => setError(`Decoder error: ${e.message}`)
+              error: (e) => {
+                console.error(`[Decoder Clip ${i+1}] Callback ERROR:`, e);
+                throw e; // Bubble up for retry
+              }
             });
 
-            decoder.configure(currentConfig);
+            try {
+              decoder.configure(currentConfig);
+            } catch (decConfErr: any) {
+              console.error(`[Clip ${i+1}] VideoDecoder.configure FAILED:`, decConfErr);
+              throw decConfErr;
+            }
+
             const stream = demuxer.read('video');
             const reader = stream.getReader();
             try {
@@ -398,12 +430,22 @@ function App() {
       setIsDone(true);
       setStatus('Finished!');
     } catch (err: any) {
+      if (!forceSafe) {
+        console.warn('[Engine] Attempt failed. Retrying with Compatibility Mode...', err);
+        // Reset encoders if possible
+        if (encoder && encoder.state !== 'closed') try { encoder.close(); } catch {}
+        if (audioEncoder && audioEncoder.state !== 'closed') try { audioEncoder.close(); } catch {}
+        
+        await new Promise(r => setTimeout(r, 500)); // Cool down
+        return concatenate(true);
+      }
+      
       console.error('[Engine] FATAL ERROR:', err);
       setError(err.message || 'An unexpected error occurred.');
     } finally {
-      setProcessing(false);
       if (encoder && encoder.state !== 'closed') encoder.close();
       if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close();
+      setProcessing(false);
     }
   };
 
@@ -469,20 +511,21 @@ function App() {
 
       {(processing || error || debugLogs.length > 0) && (
         <div style={{ marginBottom: '1.5rem' }}>
-          <button 
-            onClick={() => setShowDebug(!showDebug)}
-            style={{ 
-              background: 'none', 
-              border: 'none', 
-              color: '#64748b', 
-              fontSize: '0.75rem', 
-              textDecoration: 'underline', 
-              cursor: 'pointer',
-              marginBottom: '0.5rem'
-            }}
-          >
-            {showDebug ? 'Hide Debug Logs' : 'Show Debug Logs'}
-          </button>
+          <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '0.5rem' }}>
+            <button 
+              onClick={() => setShowDebug(!showDebug)}
+              style={{ 
+                background: 'none', 
+                border: 'none', 
+                color: '#64748b', 
+                fontSize: '0.75rem', 
+                textDecoration: 'underline', 
+                cursor: 'pointer'
+              }}
+            >
+              {showDebug ? 'Hide Debug Logs' : 'Show Debug Logs'}
+            </button>
+          </div>
           
           {showDebug && (
             <div style={{ 
@@ -567,7 +610,7 @@ function App() {
       {videos.length > 0 && !isDone && (
         <div className={styles.controls}>
           <button
-            onClick={concatenate}
+            onClick={() => concatenate()}
             disabled={processing || videos.length < 2}
             className={styles.primaryBtn}
           >
