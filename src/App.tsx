@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { WebDemuxer } from 'web-demuxer';
 
@@ -25,7 +25,7 @@ import {
   useSortable,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVertical, X, Play, Loader2, Upload, CheckCircle2, AlertTriangle, Trash2 } from 'lucide-react';
+import { GripVertical, X, Play, Loader2, Upload, CheckCircle2, AlertTriangle, Trash2, RefreshCw } from 'lucide-react';
 import styles from './App.module.css';
 
 interface VideoFile {
@@ -72,6 +72,21 @@ function App() {
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState('');
+  
+  const currentPassId = useRef(0);
+  const globalErrorFlag = useRef<Error | null>(null);
+
+  const updateUI = (passId: number, newStatus?: string, newProgress?: number) => {
+    if (passId !== currentPassId.current) return;
+    if (newStatus !== undefined) {
+      console.log(`[Pass ${passId}] Status:`, newStatus);
+      setStatus(newStatus);
+    }
+    if (newProgress !== undefined) setProgress(newProgress);
+  };
+
+  const isMobile = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
   const [error, setError] = useState<string | null>(null);
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
   const [showDebug, setShowDebug] = useState(false);
@@ -82,7 +97,7 @@ function App() {
     setDebugLogs(prev => [...prev.slice(-39), `${new Date().toLocaleTimeString()}: ${msg}`]);
   };
 
-  React.useEffect(() => {
+  useEffect(() => {
     const originalLog = console.log;
     const originalError = console.error;
     
@@ -107,10 +122,21 @@ function App() {
     };
 
     const handleError = (e: ErrorEvent) => {
-      setError(`Global Error: ${e.message}`);
+      console.error('[Watchdog] Global Error:', e.message);
+      if (processing) {
+        globalErrorFlag.current = new Error(`Browser Hardware Error: ${e.message}`);
+      } else {
+        setError(`Error: ${e.message}`);
+      }
     };
     const handleRejection = (e: PromiseRejectionEvent) => {
-      setError(`Unhandled Rejection: ${e.reason?.message || String(e.reason)}`);
+      const msg = e.reason?.message || String(e.reason);
+      console.error('[Watchdog] Unhandled Rejection:', msg);
+      if (processing) {
+        globalErrorFlag.current = new Error(`Browser Rejection: ${msg}`);
+      } else {
+        setError(`Rejection: ${msg}`);
+      }
     };
 
     window.addEventListener('error', handleError);
@@ -122,7 +148,7 @@ function App() {
       window.removeEventListener('error', handleError);
       window.removeEventListener('unhandledrejection', handleRejection);
     };
-  }, []);
+  }, [processing]);
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -169,31 +195,31 @@ function App() {
     setError(null);
   };
 
-  const concatenate = async (forceSafe = false) => {
-    if (videos.length < 2) {
-      setError('Please add at least 2 videos to stitch.');
-      return;
-    }
-    setProcessing(true);
-    if (!forceSafe) {
-      setIsDone(false);
-      setError(null);
-      setProgress(0);
-    }
-
-    console.log(`--- UNIVERSAL STITCH ENGINE STARTING (Safe: ${forceSafe}) ---`);
+  /**
+   * The core engine.
+   */
+  const runStitchEngine = async (isSafeMode: boolean, passId: number) => {
+    console.log(`--- STARTING PASS ${passId} (Safe: ${isSafeMode}) ---`);
+    const wasmUrl = new URL('/wasm-files/web-demuxer.wasm', window.location.origin).href;
+    
     let encoder: VideoEncoder | null = null;
     let audioEncoder: AudioEncoder | null = null;
     let muxer: Muxer<ArrayBufferTarget> | null = null;
 
+    let engineReject: (err: any) => void;
+    const enginePromise = new Promise<void>((_, reject) => { engineReject = reject; });
+
+    const checkFatal = () => {
+      if (globalErrorFlag.current) throw globalErrorFlag.current;
+      if (passId !== currentPassId.current) throw new Error('Pass replaced.');
+    };
+
     try {
-      setStatus(forceSafe ? 'Retrying in Compatibility Mode...' : 'Initializing Engine...');
-      const wasmUrl = new URL('/wasm-files/web-demuxer.wasm', window.location.origin).href;
-      
+      checkFatal();
+
+      // 1. Initial Metadata Pass
       const initialDemuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
-      let targetWidth: number;
-      let targetHeight: number;
-      let targetCodec: string;
+      let targetWidth: number, targetHeight: number, targetCodec: string;
       let targetAudioConfig: AudioDecoderConfig | null = null;
 
       try {
@@ -202,251 +228,202 @@ function App() {
         targetWidth = targetConfig.codedWidth!;
         targetHeight = targetConfig.codedHeight!;
         targetCodec = targetConfig.codec;
-
-        console.log(`[Init] Target Resolution: ${targetWidth}x${targetHeight}, Codec: ${targetCodec}`);
-
-        try {
-          targetAudioConfig = await initialDemuxer.getDecoderConfig('audio');
-          console.log(`[Init] Audio Detected: ${targetAudioConfig.codec}`);
-        } catch { /* No audio */ }
+        try { targetAudioConfig = await initialDemuxer.getDecoderConfig('audio'); } catch { /* no audio */ }
       } finally {
         await initialDemuxer.destroy();
       }
 
-      // Output Muxer
-      // FORCE H.264 in Safe Mode for maximum compatibility
-      const finalCodec = forceSafe ? 'avc' : ((targetCodec.startsWith('hev') || targetCodec.startsWith('hvc')) ? 'hevc' : 'avc');
-      
+      // 2. Output Muxer
+      const finalCodec = isSafeMode ? 'avc' : ((targetCodec.startsWith('hev') || targetCodec.startsWith('hvc')) ? 'hevc' : 'avc');
       muxer = new Muxer({
         target: new ArrayBufferTarget(),
-        video: {
-          codec: finalCodec,
-          width: targetWidth,
-          height: targetHeight
-        },
-        audio: targetAudioConfig ? {
-          codec: 'aac',
-          sampleRate: 44100,
-          numberOfChannels: 2
-        } : undefined,
+        video: { codec: finalCodec, width: targetWidth, height: targetHeight },
+        audio: targetAudioConfig ? { codec: 'aac', sampleRate: 44100, numberOfChannels: 2 } : undefined,
         fastStart: 'in-memory'
       });
 
-      // Video Encoder
+      // 3. Setup Encoders
       encoder = new VideoEncoder({
         output: (chunk, meta) => muxer!.addVideoChunk(chunk, meta),
-        error: (e) => {
-          console.error('[Encoder] Callback Error:', e);
-          throw e; // Bubble up to trigger retry
-        }
+        error: (e) => engineReject(new Error(`Encoder rejection: ${e.message}`))
       });
 
-      const vEncoderConfig: VideoEncoderConfig = {
-        // Safe mode uses standard AVC profile
+      const vConfig: VideoEncoderConfig = {
         codec: finalCodec === 'hevc' ? 'hev1.1.6.L120.90' : 'avc1.42E01E',
-        width: targetWidth,
-        height: targetHeight,
-        bitrate: 5_000_000,
-        framerate: 30,
-        hardwareAcceleration: forceSafe ? 'prefer-software' : 'prefer-hardware'
+        width: targetWidth, height: targetHeight, bitrate: 5_000_000, framerate: 30,
+        hardwareAcceleration: (isSafeMode || isMobile) ? 'prefer-software' : 'prefer-hardware'
       };
-
-      console.log('[Init] VideoEncoder Config:', vEncoderConfig);
-      const vSupport = await VideoEncoder.isConfigSupported(vEncoderConfig);
-      console.log('[Init] VideoEncoder Support:', vSupport);
       
-      try {
-        encoder.configure(vSupport.supported ? vEncoderConfig : { ...vEncoderConfig, hardwareAcceleration: 'prefer-software' });
-      } catch (confErr: any) {
-        console.error('[Init] VideoEncoder.configure FAILED:', confErr);
-        throw confErr;
-      }
+      const vSupport = await VideoEncoder.isConfigSupported(vConfig);
+      checkFatal();
+      encoder.configure(vSupport.supported && !isSafeMode ? vConfig : { ...vConfig, hardwareAcceleration: 'prefer-software' });
 
-      // Audio Encoder
       if (targetAudioConfig) {
         audioEncoder = new AudioEncoder({
           output: (chunk, meta) => muxer!.addAudioChunk(chunk, meta),
-          error: (e) => console.error('[AudioEncoder] ERROR:', e)
+          error: (e) => engineReject(new Error(`AudioEncoder rejection: ${e.message}`))
         });
-        audioEncoder.configure({
-          codec: 'mp4a.40.2',
-          numberOfChannels: 2,
-          sampleRate: 44100,
-          bitrate: 128_000
-        });
+        audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100, bitrate: 128_000 });
       }
 
+      // 4. Main Processing Loop
       let accumulatedTimeMicros = 0;
       let accumulatedAudioTimeMicros = 0;
       const canvas = new OffscreenCanvas(targetWidth, targetHeight);
-      const ctx = canvas.getContext('2d', { alpha: false });
-      if (!ctx) throw new Error('Failed to initialize 2D context.');
+      const ctx = canvas.getContext('2d', { alpha: false })!;
 
-      for (let i = 0; i < videos.length; i++) {
-        const videoFile = videos[i].file;
-        console.log(`[Clip ${i + 1}/${videos.length}] Processing: ${videoFile.name}`);
-        const demuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
-
-        try {
-          setStatus(forceSafe 
-            ? `Retrying ${i + 1}/${videos.length} (Compatibility Mode)...` 
-            : `Stitching clip ${i + 1}/${videos.length}...`
-          );
-          await demuxer.load(videoFile);
-          const currentConfig = await demuxer.getDecoderConfig('video');
-          const mediaInfo = await demuxer.getMediaInfo();
-          const videoDuration = mediaInfo.duration;
-
-          let currentAudioConfig: AudioDecoderConfig | null = null;
+      const loop = async () => {
+        for (let i = 0; i < videos.length; i++) {
+          checkFatal();
+          const demuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
           try {
-            currentAudioConfig = await demuxer.getDecoderConfig('audio');
-          } catch { /* No audio */ }
+            updateUI(passId, isSafeMode ? `Compatibility Pass: ${i+1}/${videos.length}` : `Fast Pass: ${i+1}/${videos.length}`);
+            await demuxer.load(videos[i].file);
+            const currentConfig = await demuxer.getDecoderConfig('video');
+            const mediaInfo = await demuxer.getMediaInfo();
+            const videoDuration = mediaInfo.duration;
+            let currentAudioConfig: AudioDecoderConfig | null = null;
+            try { currentAudioConfig = await demuxer.getDecoderConfig('audio'); } catch { /* no audio */ }
 
-          let clipVideoMaxTime = 0;
-          let clipAudioMaxTime = 0;
+            let clipVideoMaxTime = 0, clipAudioMaxTime = 0;
 
-          const processVideo = async () => {
-            let clipVideoOffset: number | null = null;
-            let frameCount = 0;
-
-            console.log(`[Clip ${i+1}] VideoDecoder Config:`, currentConfig);
-            const decoder = new VideoDecoder({
-              output: (frame) => {
-                if (clipVideoOffset === null) clipVideoOffset = frame.timestamp;
-                const timestampMicros = (frame.timestamp - clipVideoOffset) + accumulatedTimeMicros;
-                
-                ctx.fillStyle = 'black';
-                ctx.fillRect(0, 0, targetWidth, targetHeight);
-                const videoAspectRatio = frame.displayWidth / frame.displayHeight;
-                const targetAspectRatio = targetWidth / targetHeight;
-                let drawW = targetWidth, drawH = targetHeight, offX = 0, offY = 0;
-                if (videoAspectRatio > targetAspectRatio) {
-                  drawH = targetWidth / videoAspectRatio;
-                  offY = (targetHeight - drawH) / 2;
-                } else {
-                  drawW = targetHeight * videoAspectRatio;
-                  offX = (targetWidth - drawW) / 2;
-                }
-                ctx.drawImage(frame, offX, offY, drawW, drawH);
-                
-                const frameToEncode = new VideoFrame(canvas, { 
-                  timestamp: timestampMicros, 
-                  duration: frame.duration || 33333 
-                });
-                if (encoder?.state === 'configured') {
-                  encoder.encode(frameToEncode, { keyFrame: frameCount % 60 === 0 });
-                  frameCount++;
-                }
-                clipVideoMaxTime = Math.max(clipVideoMaxTime, (timestampMicros - accumulatedTimeMicros) + (frame.duration || 33333));
-                frameToEncode.close();
-                frame.close();
-              },
-              error: (e) => {
-                console.error(`[Decoder Clip ${i+1}] Callback ERROR:`, e);
-                throw e; // Bubble up for retry
-              }
-            });
-
-            try {
+            const processVideo = async () => {
+              let offset: number | null = null, frameCount = 0;
+              const decoder = new VideoDecoder({
+                output: (frame) => {
+                  if (passId !== currentPassId.current) { frame.close(); return; }
+                  if (offset === null) offset = frame.timestamp;
+                  const ts = (frame.timestamp - offset) + accumulatedTimeMicros;
+                  
+                  ctx.fillStyle = 'black'; ctx.fillRect(0, 0, targetWidth, targetHeight);
+                  const ar = frame.displayWidth / frame.displayHeight, tar = targetWidth / targetHeight;
+                  let dw = targetWidth, dh = targetHeight, ox = 0, oy = 0;
+                  if (ar > tar) { dh = targetWidth / ar; oy = (targetHeight - dh) / 2; }
+                  else { dw = targetHeight * ar; ox = (targetWidth - dw) / 2; }
+                  ctx.drawImage(frame, ox, oy, dw, dh);
+                  
+                  const fte = new VideoFrame(canvas, { timestamp: ts, duration: frame.duration || 33333 });
+                  if (encoder?.state === 'configured') {
+                    encoder.encode(fte, { keyFrame: frameCount % 60 === 0 });
+                    frameCount++;
+                  }
+                  clipVideoMaxTime = Math.max(clipVideoMaxTime, (ts - accumulatedTimeMicros) + (frame.duration || 33333));
+                  fte.close(); frame.close();
+                },
+                error: (e) => engineReject(new Error(`Decoder rejection: ${e.message}`))
+              });
               decoder.configure(currentConfig);
-            } catch (decConfErr: any) {
-              console.error(`[Clip ${i+1}] VideoDecoder.configure FAILED:`, decConfErr);
-              throw decConfErr;
-            }
-
-            const stream = demuxer.read('video');
-            const reader = stream.getReader();
-            try {
-              while (true) {
-                if (error) break;
-                const { done, value: chunk } = await reader.read();
-                if (done) break;
-                if (decoder.decodeQueueSize > 64) await new Promise(r => setTimeout(r, 0));
-                decoder.decode(chunk);
-                if (frameCount % 30 === 0) {
-                  setProgress(Math.round(((i + Math.min(1, frameCount / (videoDuration * 30))) / videos.length) * 90));
-                  await new Promise(r => setTimeout(r, 0));
+              const reader = demuxer.read('video').getReader();
+              try {
+                while (true) {
+                  checkFatal();
+                  const { done, value: chunk } = await reader.read();
+                  if (done) break;
+                  if (decoder.decodeQueueSize > 64) await new Promise(r => setTimeout(r, 0));
+                  decoder.decode(chunk);
+                  if (frameCount % 30 === 0) {
+                    updateUI(passId, undefined, Math.round(((i + Math.min(1, frameCount / (videoDuration * 30))) / videos.length) * 90));
+                    await new Promise(r => setTimeout(r, 0));
+                  }
                 }
-              }
-              await decoder.flush();
-              decoder.close();
-            } finally {
-              reader.releaseLock();
-            }
-          };
+                if (passId === currentPassId.current) { await decoder.flush(); decoder.close(); }
+              } finally { reader.releaseLock(); }
+            };
 
-          const processAudio = async () => {
-            if (!audioEncoder || !currentAudioConfig) return;
-            let clipAudioOffset: number | null = null;
-            const audioDecoder = new AudioDecoder({
-              output: (data) => {
-                if (clipAudioOffset === null) clipAudioOffset = data.timestamp;
-                const timestampMicros = (data.timestamp - clipAudioOffset) + accumulatedAudioTimeMicros;
-                if (audioEncoder?.state === 'configured') audioEncoder.encode(data);
-                clipAudioMaxTime = Math.max(clipAudioMaxTime, (timestampMicros - accumulatedAudioTimeMicros) + (data.duration || 0));
-                data.close();
-              },
-              error: (e) => console.error('[AudioDecoder] ERROR:', e)
-            });
-            audioDecoder.configure(currentAudioConfig);
-            const stream = demuxer.read('audio');
-            const reader = stream.getReader();
-            try {
-              while (true) {
-                if (error) break;
-                const { done, value: chunk } = await reader.read();
-                if (done) break;
-                if (audioDecoder.decodeQueueSize > 64) await new Promise(r => setTimeout(r, 0));
-                audioDecoder.decode(chunk);
-              }
-              await audioDecoder.flush();
-              audioDecoder.close();
-            } finally {
-              reader.releaseLock();
-            }
-          };
+            const processAudio = async () => {
+              if (!audioEncoder || !currentAudioConfig) return;
+              let offset: number | null = null;
+              const audioDecoder = new AudioDecoder({
+                output: (data) => {
+                  if (passId !== currentPassId.current) { data.close(); return; }
+                  if (offset === null) offset = data.timestamp;
+                  const ts = (data.timestamp - offset) + accumulatedAudioTimeMicros;
+                  if (audioEncoder?.state === 'configured') audioEncoder.encode(data);
+                  clipAudioMaxTime = Math.max(clipAudioMaxTime, (ts - accumulatedAudioTimeMicros) + (data.duration || 0));
+                  data.close();
+                },
+                error: (e) => engineReject(new Error(`AudioDecoder rejection: ${e.message}`))
+              });
+              audioDecoder.configure(currentAudioConfig);
+              const reader = demuxer.read('audio').getReader();
+              try {
+                while (true) {
+                  checkFatal();
+                  const { done, value: chunk } = await reader.read();
+                  if (done) break;
+                  if (audioDecoder.decodeQueueSize > 64) await new Promise(r => setTimeout(r, 0));
+                  audioDecoder.decode(chunk);
+                }
+                if (passId === currentPassId.current) { await audioDecoder.flush(); audioDecoder.close(); }
+              } finally { reader.releaseLock(); }
+            };
 
-          await Promise.all([processVideo(), processAudio()]);
-          accumulatedTimeMicros += clipVideoMaxTime;
-          accumulatedAudioTimeMicros += clipAudioMaxTime;
-        } finally {
-          await demuxer.destroy();
+            await Promise.all([processVideo(), processAudio()]);
+            checkFatal();
+            accumulatedTimeMicros += clipVideoMaxTime;
+            accumulatedAudioTimeMicros += clipAudioMaxTime;
+          } finally { await demuxer.destroy(); }
+        }
+
+        checkFatal();
+        await encoder!.flush();
+        if (audioEncoder) await audioEncoder.flush();
+        muxer!.finalize();
+        
+        const { buffer } = muxer!.target as ArrayBufferTarget;
+        const downloadUrl = URL.createObjectURL(new Blob([buffer], { type: 'video/mp4' }));
+        const a = document.createElement('a'); a.href = downloadUrl; a.download = 'stitched_video.mp4'; a.click();
+        updateUI(passId, 'Finished!', 100); setIsDone(true);
+      };
+
+      await Promise.race([loop(), enginePromise]);
+
+    } finally {
+      if (encoder && encoder.state !== 'closed') try { encoder.close(); } catch {}
+      if (audioEncoder && audioEncoder.state !== 'closed') try { audioEncoder.close(); } catch {}
+    }
+  };
+
+  /**
+   * The UI wrapper.
+   */
+  const handleConcatenate = async () => {
+    if (videos.length < 2) { setError('Please add at least 2 videos.'); return; }
+    
+    setProcessing(true);
+    setError(null);
+    setIsDone(false);
+    setProgress(0);
+
+    const startPass = async (isSafe: boolean) => {
+      currentPassId.current++;
+      const passId = currentPassId.current;
+      globalErrorFlag.current = null;
+      
+      try {
+        await runStitchEngine(isSafe, passId);
+      } catch (err: any) {
+        if (passId !== currentPassId.current) return;
+
+        const realError = globalErrorFlag.current || err;
+
+        if (!isSafe) {
+          console.warn(`[Pass ${passId}] Failed. Retrying in Compatibility Mode...`, realError);
+          updateUI(passId, 'Hardware rejection detected. Switching to Compatibility Mode...', 0);
+          await new Promise(r => setTimeout(r, 1500));
+          return startPass(true);
+        }
+        
+        console.error(`[Pass ${passId}] FATAL:`, realError);
+        setError(`Fatal Error: ${realError.message || 'The browser hardware rejected the video data twice.'}`);
+      } finally {
+        if (passId === currentPassId.current) {
+          setProcessing(false);
         }
       }
+    };
 
-      setStatus('Finalizing...');
-      await encoder.flush();
-      if (audioEncoder) await audioEncoder.flush();
-      muxer.finalize();
-      
-      const { buffer } = muxer.target as ArrayBufferTarget;
-      const downloadUrl = URL.createObjectURL(new Blob([buffer], { type: 'video/mp4' }));
-      const a = document.createElement('a');
-      a.href = downloadUrl;
-      a.download = 'stitched_video.mp4';
-      a.click();
-      
-      setProgress(100);
-      setIsDone(true);
-      setStatus('Finished!');
-    } catch (err: any) {
-      if (!forceSafe) {
-        console.warn('[Engine] Attempt failed. Retrying with Compatibility Mode...', err);
-        // Reset encoders if possible
-        if (encoder && encoder.state !== 'closed') try { encoder.close(); } catch {}
-        if (audioEncoder && audioEncoder.state !== 'closed') try { audioEncoder.close(); } catch {}
-        
-        await new Promise(r => setTimeout(r, 500)); // Cool down
-        return concatenate(true);
-      }
-      
-      console.error('[Engine] FATAL ERROR:', err);
-      setError(err.message || 'An unexpected error occurred.');
-    } finally {
-      if (encoder && encoder.state !== 'closed') encoder.close();
-      if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close();
-      setProcessing(false);
-    }
+    await startPass(false);
   };
 
 
@@ -501,10 +478,14 @@ function App() {
               padding: '0.25rem 0.5rem', 
               borderRadius: '0.25rem', 
               fontSize: '0.75rem', 
-              cursor: 'pointer' 
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.25rem'
             }}
           >
-            Reload Page
+            <RefreshCw size={12} />
+            Hard Reset
           </button>
         </div>
       )}
@@ -538,7 +519,22 @@ function App() {
               maxHeight: '250px',
               overflowY: 'auto'
             }}>
-              <div style={{ fontWeight: 'bold', marginBottom: '0.5rem', borderBottom: '1px solid #334155' }}>Debug Logs:</div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem', borderBottom: '1px solid #334155', paddingBottom: '0.25rem' }}>
+                <div style={{ fontWeight: 'bold' }}>Debug Logs:</div>
+                {processing && (
+                  <button 
+                    onClick={() => {
+                      const err = new Error('SIMULATED HARDWARE CRASH');
+                      console.error('[Manual] Triggering simulated crash...');
+                      globalErrorFlag.current = err;
+                      // We don't have direct access to abortControllerRef here, but globalErrorFlag will be caught in next loop check
+                    }}
+                    style={{ background: '#991b1b', color: 'white', border: 'none', borderRadius: '4px', padding: '2px 6px', fontSize: '10px' }}
+                  >
+                    Simulate Crash
+                  </button>
+                )}
+              </div>
               {debugLogs.map((log, i) => <div key={i}>{log}</div>)}
             </div>
           )}
@@ -610,7 +606,7 @@ function App() {
       {videos.length > 0 && !isDone && (
         <div className={styles.controls}>
           <button
-            onClick={() => concatenate()}
+            onClick={() => handleConcatenate()}
             disabled={processing || videos.length < 2}
             className={styles.primaryBtn}
           >
@@ -632,7 +628,7 @@ function App() {
               <div className={styles.progressBar}>
                 <div className={styles.progressFill} style={{ width: `${progress}%` }} />
               </div>
-              <p className={styles.status}>{status} ({progress}%)</p>
+              <p className={styles.status} data-testid="engine-status">{status} ({progress}%)</p>
             </div>
           )}
         </div>
