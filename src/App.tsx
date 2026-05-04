@@ -249,15 +249,30 @@ function App() {
       });
 
       const vConfig: VideoEncoderConfig = {
-        // Safe mode uses standard AVC profile Level 5.2 (supports 4K)
-        codec: finalCodec === 'hevc' ? 'hev1.1.6.L120.90' : 'avc1.42E034',
+        // Safe mode uses AVC Main profile Level 5.2 (supports 4K)
+        codec: finalCodec === 'hevc' ? 'hev1.1.6.L120.90' : 'avc1.4D4034',
         width: targetWidth, height: targetHeight, bitrate: 5_000_000, framerate: 30,
         hardwareAcceleration: (isSafeMode || isMobile) ? 'prefer-software' : 'prefer-hardware'
       };
       
-      const vSupport = await VideoEncoder.isConfigSupported(vConfig);
-      checkFatal();
-      encoder.configure(vSupport.supported && !isSafeMode ? vConfig : { ...vConfig, hardwareAcceleration: 'prefer-software' });
+      console.log('[Init] VideoEncoder Config:', vConfig);
+      
+      try {
+        const vSupport = await VideoEncoder.isConfigSupported(vConfig);
+        console.log('[Init] VideoEncoder Support:', vSupport);
+        
+        const finalVConfig = vSupport.supported && !isSafeMode ? vConfig : { ...vConfig, hardwareAcceleration: 'prefer-software' as const };
+        encoder.configure(finalVConfig);
+        console.log('[Init] VideoEncoder Configured:', finalVConfig.codec, finalVConfig.hardwareAcceleration);
+      } catch (e: any) {
+        console.error('[Init] Encoder Configuration Failed. Trying ultra-safe Baseline fallback.', e);
+        // Ultra-safe fallback: Baseline Level 4.0 (1080p)
+        encoder.configure({
+          codec: 'avc1.42E028',
+          width: targetWidth, height: targetHeight, bitrate: 2_000_000, framerate: 30,
+          hardwareAcceleration: 'prefer-software'
+        });
+      }
 
       if (targetAudioConfig) {
         audioEncoder = new AudioEncoder({
