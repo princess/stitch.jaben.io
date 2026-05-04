@@ -249,7 +249,8 @@ function App() {
       });
 
       const vConfig: VideoEncoderConfig = {
-        codec: finalCodec === 'hevc' ? 'hev1.1.6.L120.90' : 'avc1.42E01E',
+        // Safe mode uses standard AVC profile Level 5.2 (supports 4K)
+        codec: finalCodec === 'hevc' ? 'hev1.1.6.L120.90' : 'avc1.42E034',
         width: targetWidth, height: targetHeight, bitrate: 5_000_000, framerate: 30,
         hardwareAcceleration: (isSafeMode || isMobile) ? 'prefer-software' : 'prefer-hardware'
       };
