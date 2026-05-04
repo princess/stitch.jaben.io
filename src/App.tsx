@@ -33,21 +33,6 @@ interface VideoFile {
   file: File;
 }
 
-// Helper to compare extradata/description buffers
-const areBuffersEqual = (a: AllowSharedBufferSource | undefined, b: AllowSharedBufferSource | undefined) => {
-  if (a === b) return true;
-  if (!a || !b) return false;
-  const isSharedA = typeof SharedArrayBuffer !== 'undefined' && a instanceof SharedArrayBuffer;
-  const isSharedB = typeof SharedArrayBuffer !== 'undefined' && b instanceof SharedArrayBuffer;
-  const viewA = new Uint8Array(a instanceof ArrayBuffer || isSharedA ? (a as ArrayBuffer | SharedArrayBuffer) : (a as ArrayBufferView).buffer);
-  const viewB = new Uint8Array(b instanceof ArrayBuffer || isSharedB ? (b as ArrayBuffer | SharedArrayBuffer) : (b as ArrayBufferView).buffer);
-  if (viewA.length !== viewB.length) return false;
-  for (let i = 0; i < viewA.length; i++) {
-    if (viewA[i] !== viewB[i]) return false;
-  }
-  return true;
-};
-
 const SortableVideoItem = ({ id, file, onRemove, disabled }: { id: string; file: File; onRemove: (id: string) => void, disabled?: boolean }) => {
   const {
     attributes,
@@ -194,7 +179,9 @@ function App() {
     setError(null);
     setProgress(0);
 
-    console.log('--- STITCH ENGINE STARTING ---');
+    console.log('--- UNIVERSAL STITCH ENGINE STARTING ---');
+    let encoder: VideoEncoder | null = null;
+    let audioEncoder: AudioEncoder | null = null;
     let muxer: Muxer<ArrayBufferTarget> | null = null;
 
     try {
@@ -205,7 +192,6 @@ function App() {
       let targetWidth: number;
       let targetHeight: number;
       let targetCodec: string;
-      let targetDescription: ArrayBuffer | undefined;
       let targetAudioConfig: AudioDecoderConfig | null = null;
 
       try {
@@ -214,7 +200,6 @@ function App() {
         targetWidth = targetConfig.codedWidth!;
         targetHeight = targetConfig.codedHeight!;
         targetCodec = targetConfig.codec;
-        targetDescription = targetConfig.description ? new Uint8Array(targetConfig.description as ArrayBuffer).slice().buffer : undefined;
 
         console.log(`[Init] Target Resolution: ${targetWidth}x${targetHeight}, Codec: ${targetCodec}`);
 
@@ -226,6 +211,7 @@ function App() {
         await initialDemuxer.destroy();
       }
 
+      // Output Muxer
       muxer = new Muxer({
         target: new ArrayBufferTarget(),
         video: {
@@ -234,25 +220,56 @@ function App() {
           height: targetHeight
         },
         audio: targetAudioConfig ? {
-          codec: targetAudioConfig.codec.startsWith('mp4a') ? 'aac' : 'opus',
-          sampleRate: targetAudioConfig.sampleRate,
-          numberOfChannels: targetAudioConfig.numberOfChannels
+          codec: 'aac',
+          sampleRate: 44100,
+          numberOfChannels: 2
         } : undefined,
         fastStart: 'in-memory'
       });
 
+      // Video Encoder
+      encoder = new VideoEncoder({
+        output: (chunk, meta) => muxer!.addVideoChunk(chunk, meta),
+        error: (e) => setError(`Encoder Error: ${e.message}`)
+      });
+      const vEncoderConfig: VideoEncoderConfig = {
+        codec: (targetCodec.startsWith('hev') || targetCodec.startsWith('hvc')) ? 'hev1.1.6.L120.90' : 'avc1.4d002a',
+        width: targetWidth,
+        height: targetHeight,
+        bitrate: 5_000_000,
+        framerate: 30,
+        hardwareAcceleration: 'prefer-hardware'
+      };
+      const vSupport = await VideoEncoder.isConfigSupported(vEncoderConfig);
+      encoder.configure(vSupport.supported ? vEncoderConfig : { ...vEncoderConfig, hardwareAcceleration: 'prefer-software' });
+
+      // Audio Encoder
+      if (targetAudioConfig) {
+        audioEncoder = new AudioEncoder({
+          output: (chunk, meta) => muxer!.addAudioChunk(chunk, meta),
+          error: (e) => console.error('[AudioEncoder] ERROR:', e)
+        });
+        audioEncoder.configure({
+          codec: 'mp4a.40.2',
+          numberOfChannels: 2,
+          sampleRate: 44100,
+          bitrate: 128_000
+        });
+      }
+
       let accumulatedTimeMicros = 0;
-      let lastDts = -1;
-      let lastAudioDts = -1;
+      let accumulatedAudioTimeMicros = 0;
+      const canvas = new OffscreenCanvas(targetWidth, targetHeight);
+      const ctx = canvas.getContext('2d', { alpha: false });
+      if (!ctx) throw new Error('Failed to initialize 2D context.');
 
       for (let i = 0; i < videos.length; i++) {
         const videoFile = videos[i].file;
-        console.log(`[Clip ${i + 1}/${videos.length}] --- STARTING CLIP: ${videoFile.name} ---`);
-        
+        console.log(`[Clip ${i + 1}/${videos.length}] Processing: ${videoFile.name}`);
         const demuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
 
         try {
-          setStatus(`Loading clip ${i + 1}/${videos.length}...`);
+          setStatus(`Stitching clip ${i + 1}/${videos.length}...`);
           await demuxer.load(videoFile);
           const currentConfig = await demuxer.getDecoderConfig('video');
           const mediaInfo = await demuxer.getMediaInfo();
@@ -263,111 +280,113 @@ function App() {
             currentAudioConfig = await demuxer.getDecoderConfig('audio');
           } catch { /* No audio */ }
 
-          const isCompatible = currentConfig.codec === targetCodec &&
-            currentConfig.codedWidth === targetWidth &&
-            currentConfig.codedHeight === targetHeight &&
-            areBuffersEqual(currentConfig.description, targetDescription);
-
-          console.log(`[Clip ${i + 1}] Path: ${isCompatible ? 'FAST' : 'SLOW (Not supported yet)'}`);
-          if (!isCompatible) throw new Error(`Clip ${i+1} is incompatible with first clip resolution/codec.`);
-
-          let clipMaxTime = 0;
-          let clipVideoOffset: number | null = null;
-          let clipAudioOffset: number | null = null;
+          let clipVideoMaxTime = 0;
+          let clipAudioMaxTime = 0;
 
           const processVideo = async () => {
+            let clipVideoOffset: number | null = null;
+            let frameCount = 0;
+
+            const decoder = new VideoDecoder({
+              output: (frame) => {
+                if (clipVideoOffset === null) clipVideoOffset = frame.timestamp;
+                const timestampMicros = (frame.timestamp - clipVideoOffset) + accumulatedTimeMicros;
+                
+                ctx.fillStyle = 'black';
+                ctx.fillRect(0, 0, targetWidth, targetHeight);
+                const videoAspectRatio = frame.displayWidth / frame.displayHeight;
+                const targetAspectRatio = targetWidth / targetHeight;
+                let drawW = targetWidth, drawH = targetHeight, offX = 0, offY = 0;
+                if (videoAspectRatio > targetAspectRatio) {
+                  drawH = targetWidth / videoAspectRatio;
+                  offY = (targetHeight - drawH) / 2;
+                } else {
+                  drawW = targetHeight * videoAspectRatio;
+                  offX = (targetWidth - drawW) / 2;
+                }
+                ctx.drawImage(frame, offX, offY, drawW, drawH);
+                
+                const frameToEncode = new VideoFrame(canvas, { 
+                  timestamp: timestampMicros, 
+                  duration: frame.duration || 33333 
+                });
+                if (encoder?.state === 'configured') {
+                  encoder.encode(frameToEncode, { keyFrame: frameCount % 60 === 0 });
+                  frameCount++;
+                }
+                clipVideoMaxTime = Math.max(clipVideoMaxTime, (timestampMicros - accumulatedTimeMicros) + (frame.duration || 33333));
+                frameToEncode.close();
+                frame.close();
+              },
+              error: (e) => setError(`Decoder error: ${e.message}`)
+            });
+
+            decoder.configure(currentConfig);
             const stream = demuxer.read('video');
             const reader = stream.getReader();
-            let chunkCount = 0;
-            let batchStartTime = performance.now();
             try {
               while (true) {
-                if (error) throw new Error(error);
+                if (error) break;
                 const { done, value: chunk } = await reader.read();
                 if (done) break;
-                
-                if (clipVideoOffset === null) clipVideoOffset = chunk.timestamp;
-                let timestamp = (chunk.timestamp - clipVideoOffset!) + accumulatedTimeMicros;
-                if (timestamp <= lastDts) timestamp = lastDts + 1;
-                lastDts = timestamp;
-
-                const data = new Uint8Array(chunk.byteLength);
-                chunk.copyTo(data);
-                
-                muxer!.addVideoChunk(new EncodedVideoChunk({
-                  type: chunk.type,
-                  timestamp,
-                  duration: chunk.duration ?? undefined,
-                  data
-                }), { decoderConfig: currentConfig });
-
-                clipMaxTime = Math.max(clipMaxTime, timestamp - accumulatedTimeMicros + (chunk.duration ?? 0));
-                
-                chunkCount++;
-                if (chunkCount % 100 === 0) {
-                  const now = performance.now();
-                  console.log(`[Clip ${i+1}] Video: 100 chunks in ${Math.round(now - batchStartTime)}ms`);
-                  batchStartTime = now;
-                  const currentVideoProgress = videoDuration > 0 ? Math.min(chunk.timestamp / (videoDuration * 1_000_000), 1) : 0;
-                  setProgress(Math.round(((i + currentVideoProgress) / videos.length) * 90));
-                  // YIELD to UI
+                if (decoder.decodeQueueSize > 64) await new Promise(r => setTimeout(r, 0));
+                decoder.decode(chunk);
+                if (frameCount % 30 === 0) {
+                  setProgress(Math.round(((i + Math.min(1, frameCount / (videoDuration * 30))) / videos.length) * 90));
                   await new Promise(r => setTimeout(r, 0));
                 }
               }
+              await decoder.flush();
+              decoder.close();
             } finally {
               reader.releaseLock();
             }
           };
 
           const processAudio = async () => {
-            if (targetAudioConfig && currentAudioConfig && 
-                currentAudioConfig.codec === targetAudioConfig.codec &&
-                currentAudioConfig.sampleRate === targetAudioConfig.sampleRate &&
-                currentAudioConfig.numberOfChannels === targetAudioConfig.numberOfChannels) {
-              const stream = demuxer.read('audio');
-              const reader = stream.getReader();
-              let audioChunkCount = 0;
-              try {
-                while (true) {
-                  if (error) throw new Error(error);
-                  const { done, value: chunk } = await reader.read();
-                  if (done) break;
-
-                  if (clipAudioOffset === null) clipAudioOffset = chunk.timestamp;
-                  let timestamp = (chunk.timestamp - clipAudioOffset!) + accumulatedTimeMicros;
-                  if (timestamp <= lastAudioDts) timestamp = lastAudioDts + 1;
-                  lastAudioDts = timestamp;
-                  
-                  const data = new Uint8Array(chunk.byteLength);
-                  chunk.copyTo(data);
-                  
-                  muxer!.addAudioChunk(new EncodedAudioChunk({
-                    type: chunk.type,
-                    timestamp,
-                    duration: chunk.duration ?? undefined,
-                    data
-                  }), { decoderConfig: currentAudioConfig });
-                  
-                  audioChunkCount++;
-                  if (audioChunkCount % 100 === 0) {
-                    await new Promise(r => setTimeout(r, 0));
-                  }
-                }
-              } finally {
-                reader.releaseLock();
+            if (!audioEncoder || !currentAudioConfig) return;
+            let clipAudioOffset: number | null = null;
+            const audioDecoder = new AudioDecoder({
+              output: (data) => {
+                if (clipAudioOffset === null) clipAudioOffset = data.timestamp;
+                const timestampMicros = (data.timestamp - clipAudioOffset) + accumulatedAudioTimeMicros;
+                if (audioEncoder?.state === 'configured') audioEncoder.encode(data);
+                clipAudioMaxTime = Math.max(clipAudioMaxTime, (timestampMicros - accumulatedAudioTimeMicros) + (data.duration || 0));
+                data.close();
+              },
+              error: (e) => console.error('[AudioDecoder] ERROR:', e)
+            });
+            audioDecoder.configure(currentAudioConfig);
+            const stream = demuxer.read('audio');
+            const reader = stream.getReader();
+            try {
+              while (true) {
+                if (error) break;
+                const { done, value: chunk } = await reader.read();
+                if (done) break;
+                if (audioDecoder.decodeQueueSize > 64) await new Promise(r => setTimeout(r, 0));
+                audioDecoder.decode(chunk);
               }
+              await audioDecoder.flush();
+              audioDecoder.close();
+            } finally {
+              reader.releaseLock();
             }
           };
 
           await Promise.all([processVideo(), processAudio()]);
-          accumulatedTimeMicros += Math.max(clipMaxTime, Math.round(videoDuration * 1_000_000));
+          accumulatedTimeMicros += clipVideoMaxTime;
+          accumulatedAudioTimeMicros += clipAudioMaxTime;
         } finally {
           await demuxer.destroy();
         }
       }
 
       setStatus('Finalizing...');
+      await encoder.flush();
+      if (audioEncoder) await audioEncoder.flush();
       muxer.finalize();
+      
       const { buffer } = muxer.target as ArrayBufferTarget;
       const downloadUrl = URL.createObjectURL(new Blob([buffer], { type: 'video/mp4' }));
       const a = document.createElement('a');
@@ -383,6 +402,8 @@ function App() {
       setError(err.message || 'An unexpected error occurred.');
     } finally {
       setProcessing(false);
+      if (encoder && encoder.state !== 'closed') encoder.close();
+      if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close();
     }
   };
 
