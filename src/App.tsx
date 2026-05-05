@@ -347,10 +347,18 @@ function App() {
                 },
                 error: (e) => engineReject(new Error(`Decoder rejection: ${e.message}`))
               });
-              decoder.configure({
+              const dConfig: VideoDecoderConfig = {
                 ...currentConfig,
                 hardwareAcceleration: isSafeMode ? 'prefer-software' : 'prefer-hardware'
-              });
+              };
+
+              const dSupport = await VideoDecoder.isConfigSupported(dConfig);
+              if (dSupport.supported) {
+                decoder.configure(dConfig);
+              } else {
+                console.warn('[Process] VideoDecoder software configuration not supported. Falling back to hardware.', dConfig.codec);
+                decoder.configure({ ...dConfig, hardwareAcceleration: 'prefer-hardware' });
+              }
               const reader = demuxer.read('video').getReader();
               try {
                 while (true) {
