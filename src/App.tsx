@@ -372,7 +372,7 @@ function App() {
               try {
                 while (true) {
                   checkFatal();
-                  if (decoder.decodeQueueSize > 8 || (encoder && encoder.encodeQueueSize > 8)) {
+                  if (decoder.decodeQueueSize > 4 || (encoder && encoder.encodeQueueSize > 4)) {
                     await new Promise(r => setTimeout(r, 10));
                     continue;
                   }
@@ -392,7 +392,7 @@ function App() {
               if (!audioEncoder || !currentAudioConfig) return;
               let offset: number | null = null;
               const audioDecoder = new AudioDecoder({
-                output: async (data) => {
+                output: (data) => {
                   if (passId !== currentPassId.current) { data.close(); return; }
                   if (offset === null) offset = data.timestamp;
 
@@ -404,39 +404,46 @@ function App() {
                   lastAudioTs = ts;
 
                   if (audioEncoder?.state === 'configured') {
-                    // Devil's Advocate: Robust Audio Resampling to 44.1kHz
-                    // Many encoders fail if the input sample rate doesn't match the config.
-                    let finalData = data;
+                    // Optimized Linear Resampler (Zero-OfflineContext)
+                    // OfflineAudioContext per chunk is too expensive for mobile.
+                    let finalData: AudioData;
+                    
                     if (data.sampleRate !== 44100 || data.numberOfChannels !== 2) {
-                      const offlineCtx = new OfflineAudioContext(2, (data.numberOfFrames * 44100) / data.sampleRate, 44100);
-                      const audioBuffer = offlineCtx.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate);
+                      const ratio = data.sampleRate / 44100;
+                      const newFrames = Math.floor(data.numberOfFrames / ratio);
+                      const interleaved = new Float32Array(newFrames * 2);
+                      
+                      const planes: Float32Array[] = [];
                       for (let i = 0; i < data.numberOfChannels; i++) {
-                        const plane = new Float32Array(data.numberOfFrames);
-                        data.copyTo(plane, { planeIndex: i });
-                        audioBuffer.copyToChannel(plane, i);
+                        const p = new Float32Array(data.numberOfFrames);
+                        data.copyTo(p, { planeIndex: i });
+                        planes.push(p);
                       }
-                      const source = offlineCtx.createBufferSource();
-                      source.buffer = audioBuffer;
-                      source.connect(offlineCtx.destination);
-                      source.start();
-                      const rendered = await offlineCtx.startRendering();
-                      
-                      const interleaved = new Float32Array(rendered.length * 2);
-                      for (let i = 0; i < rendered.length; i++) {
-                        interleaved[i * 2] = rendered.getChannelData(0)[i];
-                        interleaved[i * 2 + 1] = rendered.getChannelData(1)[i];
+
+                      for (let i = 0; i < newFrames; i++) {
+                        const srcIdx = i * ratio;
+                        const idx1 = Math.floor(srcIdx);
+                        const idx2 = Math.min(idx1 + 1, data.numberOfFrames - 1);
+                        const weight = srcIdx - idx1;
+
+                        for (let ch = 0; ch < 2; ch++) {
+                          const srcCh = ch % data.numberOfChannels;
+                          const v1 = planes[srcCh][idx1];
+                          const v2 = planes[srcCh][idx2];
+                          interleaved[i * 2 + ch] = v1 * (1 - weight) + v2 * weight;
+                        }
                       }
-                      
+
                       finalData = new AudioData({
                         format: 'f32',
                         sampleRate: 44100,
-                        numberOfFrames: rendered.length,
+                        numberOfFrames: newFrames,
                         numberOfChannels: 2,
                         timestamp: ts,
                         data: interleaved
                       });
                     } else {
-                      // Just fix timestamp
+                      // Fix timestamp for matching formats (mostly planar to interleaved)
                       const size = data.allocationSize({ planeIndex: 0 });
                       const buffer = new Uint8Array(size);
                       data.copyTo(buffer, { planeIndex: 0 });
@@ -446,12 +453,12 @@ function App() {
                         numberOfFrames: data.numberOfFrames,
                         numberOfChannels: data.numberOfChannels,
                         timestamp: ts,
-                        data: buffer
+                        data: buffer as any
                       });
                     }
                     
                     audioEncoder.encode(finalData);
-                    if (finalData !== data) finalData.close();
+                    finalData.close();
                   }
                   clipAudioMaxTime = Math.max(clipAudioMaxTime, (ts - accumulatedAudioTimeMicros) + (data.duration || 0));
                   data.close();
@@ -463,7 +470,7 @@ function App() {
               try {
                 while (true) {
                   checkFatal();
-                  if (audioDecoder.decodeQueueSize > 8 || (audioEncoder && audioEncoder.encodeQueueSize > 8)) {
+                  if (audioDecoder.decodeQueueSize > 4 || (audioEncoder && audioEncoder.encodeQueueSize > 4)) {
                     await new Promise(r => setTimeout(r, 10));
                     continue;
                   }
@@ -475,7 +482,9 @@ function App() {
               } finally { reader.releaseLock(); }
             };
 
-            await Promise.all([processVideo(), processAudio()]);
+            // Sequential processing to save memory on mobile
+            await processVideo();
+            await processAudio();
             checkFatal();
             
             // Devil's Advocate: Synchronized track alignment.
