@@ -25,7 +25,7 @@ import {
   useSortable,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVertical, X, Play, Loader2, Upload, CheckCircle2, AlertTriangle, Trash2, RefreshCw } from 'lucide-react';
+import { GripVertical, X, Play, Loader2, Upload, CheckCircle2, AlertTriangle, Trash2, RefreshCw, Copy } from 'lucide-react';
 import styles from './App.module.css';
 
 interface VideoFile {
@@ -90,6 +90,15 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
   const [showDebug, setShowDebug] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const handleCopyLogs = () => {
+    const logText = debugLogs.join('\n');
+    navigator.clipboard.writeText(logText).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
   const [isDone, setIsDone] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -198,7 +207,7 @@ function App() {
   /**
    * The core engine.
    */
-  const runStitchEngine = async (isSafeMode: boolean, passId: number) => {
+  const runStitchEngine = async (isSafeMode: boolean, passId: number, signal: AbortSignal) => {
     console.log(`--- STARTING PASS ${passId} (Safe: ${isSafeMode}) ---`);
     const wasmUrl = new URL('/wasm-files/web-demuxer.wasm', window.location.origin).href;
     
@@ -210,6 +219,7 @@ function App() {
     const enginePromise = new Promise<void>((_, reject) => { engineReject = reject; });
 
     const checkFatal = () => {
+      if (signal.aborted) throw new Error('Pass aborted.');
       if (globalErrorFlag.current) throw globalErrorFlag.current;
       if (passId !== currentPassId.current) throw new Error('Pass replaced.');
     };
@@ -238,7 +248,11 @@ function App() {
       muxer = new Muxer({
         target: new ArrayBufferTarget(),
         video: { codec: finalCodec, width: targetWidth, height: targetHeight },
-        audio: targetAudioConfig ? { codec: 'aac', sampleRate: 44100, numberOfChannels: 2 } : undefined,
+        audio: targetAudioConfig ? { 
+          codec: 'aac', 
+          sampleRate: targetAudioConfig.sampleRate, 
+          numberOfChannels: targetAudioConfig.numberOfChannels 
+        } : undefined,
         fastStart: 'in-memory'
       });
 
@@ -279,7 +293,12 @@ function App() {
           output: (chunk, meta) => muxer!.addAudioChunk(chunk, meta),
           error: (e) => engineReject(new Error(`AudioEncoder rejection: ${e.message}`))
         });
-        audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100, bitrate: 128_000 });
+        audioEncoder.configure({ 
+          codec: 'mp4a.40.2', 
+          numberOfChannels: targetAudioConfig.numberOfChannels, 
+          sampleRate: targetAudioConfig.sampleRate, 
+          bitrate: 128_000 
+        });
       }
 
       // 4. Main Processing Loop
@@ -328,14 +347,20 @@ function App() {
                 },
                 error: (e) => engineReject(new Error(`Decoder rejection: ${e.message}`))
               });
-              decoder.configure(currentConfig);
+              decoder.configure({
+                ...currentConfig,
+                hardwareAcceleration: isSafeMode ? 'prefer-software' : 'prefer-hardware'
+              });
               const reader = demuxer.read('video').getReader();
               try {
                 while (true) {
                   checkFatal();
+                  if (decoder.decodeQueueSize > 16 || (encoder && encoder.encodeQueueSize > 16)) {
+                    await new Promise(r => setTimeout(r, 10));
+                    continue;
+                  }
                   const { done, value: chunk } = await reader.read();
                   if (done) break;
-                  if (decoder.decodeQueueSize > 64) await new Promise(r => setTimeout(r, 0));
                   decoder.decode(chunk);
                   if (frameCount % 30 === 0) {
                     updateUI(passId, undefined, Math.round(((i + Math.min(1, frameCount / (videoDuration * 30))) / videos.length) * 90));
@@ -365,9 +390,12 @@ function App() {
               try {
                 while (true) {
                   checkFatal();
+                  if (audioDecoder.decodeQueueSize > 16 || (audioEncoder && audioEncoder.encodeQueueSize > 16)) {
+                    await new Promise(r => setTimeout(r, 10));
+                    continue;
+                  }
                   const { done, value: chunk } = await reader.read();
                   if (done) break;
-                  if (audioDecoder.decodeQueueSize > 64) await new Promise(r => setTimeout(r, 0));
                   audioDecoder.decode(chunk);
                 }
                 if (passId === currentPassId.current) { await audioDecoder.flush(); audioDecoder.close(); }
@@ -403,6 +431,8 @@ function App() {
   /**
    * The UI wrapper.
    */
+  const abortControllerRef = useRef<AbortController | null>(null);
+
   const handleConcatenate = async () => {
     if (videos.length < 2) { setError('Please add at least 2 videos.'); return; }
     
@@ -414,10 +444,15 @@ function App() {
     const startPass = async (isSafe: boolean) => {
       currentPassId.current++;
       const passId = currentPassId.current;
+      
+      if (abortControllerRef.current) abortControllerRef.current.abort();
+      abortControllerRef.current = new AbortController();
+      const signal = abortControllerRef.current.signal;
+
       globalErrorFlag.current = null;
       
       try {
-        await runStitchEngine(isSafe, passId);
+        await runStitchEngine(isSafe, passId, signal);
       } catch (err: any) {
         if (passId !== currentPassId.current) return;
 
@@ -536,7 +571,29 @@ function App() {
               overflowY: 'auto'
             }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem', borderBottom: '1px solid #334155', paddingBottom: '0.25rem' }}>
-                <div style={{ fontWeight: 'bold' }}>Debug Logs:</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <div style={{ fontWeight: 'bold' }}>Debug Logs:</div>
+                  <button
+                    onClick={handleCopyLogs}
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      color: copied ? '#4ade80' : '#94a3b8',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.25rem',
+                      fontSize: '0.75rem',
+                      padding: '2px 4px',
+                      borderRadius: '4px',
+                      transition: 'color 0.2s'
+                    }}
+                    title="Copy logs to clipboard"
+                  >
+                    <Copy size={12} />
+                    {copied ? 'Copied!' : 'Copy'}
+                  </button>
+                </div>
                 {processing && (
                   <button 
                     onClick={() => {
