@@ -263,8 +263,9 @@ function App() {
       });
 
       const vConfig: VideoEncoderConfig = {
-        // Safe mode uses AVC Main profile Level 5.2 (supports 4K)
-        codec: finalCodec === 'hevc' ? 'hev1.1.6.L120.90' : 'avc1.4D4034',
+        // Safe mode uses AVC Baseline profile Level 4.0 (max 1080p) or 5.2 (4K)
+        // We use Baseline for maximum compatibility in software mode.
+        codec: finalCodec === 'hevc' ? 'hev1.1.6.L120.90' : (isSafeMode ? 'avc1.42E028' : 'avc1.4D4034'),
         width: targetWidth, height: targetHeight, bitrate: 5_000_000, framerate: 30,
         hardwareAcceleration: (isSafeMode || isMobile) ? 'prefer-software' : 'prefer-hardware'
       };
@@ -304,6 +305,8 @@ function App() {
       // 4. Main Processing Loop
       let accumulatedTimeMicros = 0;
       let accumulatedAudioTimeMicros = 0;
+      let lastVideoTs = -1;
+      let lastAudioTs = -1;
       const canvas = new OffscreenCanvas(targetWidth, targetHeight);
       const ctx = canvas.getContext('2d', { alpha: false })!;
 
@@ -328,7 +331,11 @@ function App() {
                 output: (frame) => {
                   if (passId !== currentPassId.current) { frame.close(); return; }
                   if (offset === null) offset = frame.timestamp;
-                  const ts = (frame.timestamp - offset) + accumulatedTimeMicros;
+                  
+                  // Ensure non-negative and monotonic timestamps
+                  let ts = Math.max(0, (frame.timestamp - offset)) + accumulatedTimeMicros;
+                  if (ts <= lastVideoTs) ts = lastVideoTs + 1;
+                  lastVideoTs = ts;
                   
                   ctx.fillStyle = 'black'; ctx.fillRect(0, 0, targetWidth, targetHeight);
                   const ar = frame.displayWidth / frame.displayHeight, tar = targetWidth / targetHeight;
@@ -386,8 +393,29 @@ function App() {
                 output: (data) => {
                   if (passId !== currentPassId.current) { data.close(); return; }
                   if (offset === null) offset = data.timestamp;
-                  const ts = (data.timestamp - offset) + accumulatedAudioTimeMicros;
-                  if (audioEncoder?.state === 'configured') audioEncoder.encode(data);
+
+                  if (data.numberOfFrames === 0) { data.close(); return; }
+
+                  // Ensure non-negative and monotonic timestamps
+                  let ts = Math.max(0, (data.timestamp - offset)) + accumulatedAudioTimeMicros;
+                  if (ts <= lastAudioTs) ts = lastAudioTs + 1;
+                  lastAudioTs = ts;
+
+                  if (audioEncoder?.state === 'configured') {
+                    // Reconstruct AudioData to fix timestamp for the encoder
+                    const buffer = new Float32Array(data.numberOfFrames * data.numberOfChannels);
+                    data.copyTo(buffer, { planeIndex: 0 });
+                    const newData = new AudioData({
+                      format: data.format!,
+                      sampleRate: data.sampleRate,
+                      numberOfFrames: data.numberOfFrames,
+                      numberOfChannels: data.numberOfChannels,
+                      timestamp: ts,
+                      data: buffer
+                    });
+                    audioEncoder.encode(newData);
+                    newData.close();
+                  }
                   clipAudioMaxTime = Math.max(clipAudioMaxTime, (ts - accumulatedAudioTimeMicros) + (data.duration || 0));
                   data.close();
                 },
