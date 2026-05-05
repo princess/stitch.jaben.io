@@ -235,8 +235,9 @@ function App() {
       try {
         await initialDemuxer.load(videos[0].file);
         const targetConfig = await initialDemuxer.getDecoderConfig('video');
-        targetWidth = targetConfig.codedWidth!;
-        targetHeight = targetConfig.codedHeight!;
+        // Encoders (especially H.264) require even dimensions.
+        targetWidth = Math.floor(targetConfig.codedWidth! / 2) * 2;
+        targetHeight = Math.floor(targetConfig.codedHeight! / 2) * 2;
         targetCodec = targetConfig.codec;
         try { targetAudioConfig = await initialDemuxer.getDecoderConfig('audio'); } catch { /* no audio */ }
       } finally {
@@ -250,10 +251,11 @@ function App() {
         video: { codec: finalCodec, width: targetWidth, height: targetHeight },
         audio: targetAudioConfig ? { 
           codec: 'aac', 
-          sampleRate: targetAudioConfig.sampleRate, 
-          numberOfChannels: targetAudioConfig.numberOfChannels 
+          sampleRate: 44100, // Standardize to 44.1kHz for robustness
+          numberOfChannels: 2 
         } : undefined,
-        fastStart: 'in-memory'
+        fastStart: 'in-memory',
+        firstTimestampBehavior: 'offset' // Ensure it starts at 0
       });
 
       // 3. Setup Encoders
@@ -296,8 +298,8 @@ function App() {
         });
         audioEncoder.configure({ 
           codec: 'mp4a.40.2', 
-          numberOfChannels: targetAudioConfig.numberOfChannels, 
-          sampleRate: targetAudioConfig.sampleRate, 
+          numberOfChannels: 2,
+          sampleRate: 44100,
           bitrate: 128_000 
         });
       }
@@ -370,7 +372,7 @@ function App() {
               try {
                 while (true) {
                   checkFatal();
-                  if (decoder.decodeQueueSize > 16 || (encoder && encoder.encodeQueueSize > 16)) {
+                  if (decoder.decodeQueueSize > 8 || (encoder && encoder.encodeQueueSize > 8)) {
                     await new Promise(r => setTimeout(r, 10));
                     continue;
                   }
@@ -390,7 +392,7 @@ function App() {
               if (!audioEncoder || !currentAudioConfig) return;
               let offset: number | null = null;
               const audioDecoder = new AudioDecoder({
-                output: (data) => {
+                output: async (data) => {
                   if (passId !== currentPassId.current) { data.close(); return; }
                   if (offset === null) offset = data.timestamp;
 
@@ -402,19 +404,54 @@ function App() {
                   lastAudioTs = ts;
 
                   if (audioEncoder?.state === 'configured') {
-                    // Reconstruct AudioData to fix timestamp for the encoder
-                    const buffer = new Float32Array(data.numberOfFrames * data.numberOfChannels);
-                    data.copyTo(buffer, { planeIndex: 0 });
-                    const newData = new AudioData({
-                      format: data.format!,
-                      sampleRate: data.sampleRate,
-                      numberOfFrames: data.numberOfFrames,
-                      numberOfChannels: data.numberOfChannels,
-                      timestamp: ts,
-                      data: buffer
-                    });
-                    audioEncoder.encode(newData);
-                    newData.close();
+                    // Devil's Advocate: Robust Audio Resampling to 44.1kHz
+                    // Many encoders fail if the input sample rate doesn't match the config.
+                    let finalData = data;
+                    if (data.sampleRate !== 44100 || data.numberOfChannels !== 2) {
+                      const offlineCtx = new OfflineAudioContext(2, (data.numberOfFrames * 44100) / data.sampleRate, 44100);
+                      const audioBuffer = offlineCtx.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate);
+                      for (let i = 0; i < data.numberOfChannels; i++) {
+                        const plane = new Float32Array(data.numberOfFrames);
+                        data.copyTo(plane, { planeIndex: i });
+                        audioBuffer.copyToChannel(plane, i);
+                      }
+                      const source = offlineCtx.createBufferSource();
+                      source.buffer = audioBuffer;
+                      source.connect(offlineCtx.destination);
+                      source.start();
+                      const rendered = await offlineCtx.startRendering();
+                      
+                      const interleaved = new Float32Array(rendered.length * 2);
+                      for (let i = 0; i < rendered.length; i++) {
+                        interleaved[i * 2] = rendered.getChannelData(0)[i];
+                        interleaved[i * 2 + 1] = rendered.getChannelData(1)[i];
+                      }
+                      
+                      finalData = new AudioData({
+                        format: 'f32',
+                        sampleRate: 44100,
+                        numberOfFrames: rendered.length,
+                        numberOfChannels: 2,
+                        timestamp: ts,
+                        data: interleaved
+                      });
+                    } else {
+                      // Just fix timestamp
+                      const size = data.allocationSize({ planeIndex: 0 });
+                      const buffer = new Uint8Array(size);
+                      data.copyTo(buffer, { planeIndex: 0 });
+                      finalData = new AudioData({
+                        format: data.format!,
+                        sampleRate: data.sampleRate,
+                        numberOfFrames: data.numberOfFrames,
+                        numberOfChannels: data.numberOfChannels,
+                        timestamp: ts,
+                        data: buffer
+                      });
+                    }
+                    
+                    audioEncoder.encode(finalData);
+                    if (finalData !== data) finalData.close();
                   }
                   clipAudioMaxTime = Math.max(clipAudioMaxTime, (ts - accumulatedAudioTimeMicros) + (data.duration || 0));
                   data.close();
@@ -426,7 +463,7 @@ function App() {
               try {
                 while (true) {
                   checkFatal();
-                  if (audioDecoder.decodeQueueSize > 16 || (audioEncoder && audioEncoder.encodeQueueSize > 16)) {
+                  if (audioDecoder.decodeQueueSize > 8 || (audioEncoder && audioEncoder.encodeQueueSize > 8)) {
                     await new Promise(r => setTimeout(r, 10));
                     continue;
                   }
@@ -440,8 +477,13 @@ function App() {
 
             await Promise.all([processVideo(), processAudio()]);
             checkFatal();
-            accumulatedTimeMicros += clipVideoMaxTime;
-            accumulatedAudioTimeMicros += clipAudioMaxTime;
+            
+            // Devil's Advocate: Synchronized track alignment.
+            // Using the container duration or the max track duration ensures video and audio 
+            // from the next clip start at the same synchronized point.
+            const clipDuration = Math.max(clipVideoMaxTime, clipAudioMaxTime, (videoDuration || 0));
+            accumulatedTimeMicros += clipDuration;
+            accumulatedAudioTimeMicros += clipDuration;
           } finally { await demuxer.destroy(); }
         }
 
@@ -502,7 +544,8 @@ function App() {
         }
         
         console.error(`[Pass ${passId}] FATAL:`, realError);
-        setError(`Fatal Error: ${realError.message || 'The browser hardware rejected the video data twice.'}`);
+        if (realError.stack) console.error(realError.stack);
+        setError(`Fatal Error: ${realError.name}: ${realError.message || 'The browser hardware rejected the video data twice.'}`);
       } finally {
         if (passId === currentPassId.current) {
           setProcessing(false);
