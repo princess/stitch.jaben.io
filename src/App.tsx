@@ -519,6 +519,40 @@ function App() {
    * The UI wrapper.
    */
   const abortControllerRef = useRef<AbortController | null>(null);
+  const wakeLockRef = useRef<any>(null);
+
+  const requestWakeLock = async () => {
+    if ('wakeLock' in navigator) {
+      try {
+        wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
+        console.log('[System] Screen Wake Lock acquired.');
+      } catch (err: any) {
+        console.warn('[System] Wake Lock failed:', err.message);
+      }
+    }
+  };
+
+  const releaseWakeLock = async () => {
+    if (wakeLockRef.current) {
+      try {
+        await wakeLockRef.current.release();
+        wakeLockRef.current = null;
+        console.log('[System] Screen Wake Lock released.');
+      } catch (err: any) {
+        console.error('[System] Wake Lock release error:', err.message);
+      }
+    }
+  };
+
+  useEffect(() => {
+    const handleVisibility = async () => {
+      if (document.visibilityState === 'visible' && processing && !wakeLockRef.current) {
+        await requestWakeLock();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, [processing]);
 
   const handleConcatenate = async () => {
     if (videos.length < 2) { setError('Please add at least 2 videos.'); return; }
@@ -527,6 +561,7 @@ function App() {
     setError(null);
     setIsDone(false);
     setProgress(0);
+    await requestWakeLock();
 
     const startPass = async (isSafe: boolean) => {
       currentPassId.current++;
@@ -558,6 +593,7 @@ function App() {
       } finally {
         if (passId === currentPassId.current) {
           setProcessing(false);
+          await releaseWakeLock();
         }
       }
     };
