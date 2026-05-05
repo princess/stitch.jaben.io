@@ -1,5 +1,13 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { 
+  Output, 
+  Mp4OutputFormat, 
+  BufferTarget, 
+  StreamTarget,
+  EncodedVideoPacketSource, 
+  EncodedAudioPacketSource, 
+  EncodedPacket 
+} from 'mediabunny';
 import { WebDemuxer } from 'web-demuxer';
 
  
@@ -91,6 +99,8 @@ function App() {
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
   const [showDebug, setShowDebug] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [streamToDisk, setStreamToDisk] = useState(false);
+  const [canStreamToDisk] = useState(() => typeof window !== 'undefined' && 'showSaveFilePicker' in window);
 
   const handleCopyLogs = () => {
     const logText = debugLogs.join('\n');
@@ -110,7 +120,7 @@ function App() {
     const originalLog = console.log;
     const originalError = console.error;
     
-    const stringifyArgs = (args: any[]) => {
+    const stringifyArgs = (args: unknown[]) => {
       return args.map(arg => {
         if (arg instanceof Error) return `${arg.name}: ${arg.message}`;
         if (arg instanceof DOMException) return `DOMException: ${arg.name} - ${arg.message}`;
@@ -207,15 +217,17 @@ function App() {
   /**
    * The core engine.
    */
-  const runStitchEngine = async (isSafeMode: boolean, passId: number, signal: AbortSignal) => {
+  const runStitchEngine = async (isSafeMode: boolean, passId: number, signal: AbortSignal, target: BufferTarget | StreamTarget) => {
     console.log(`--- STARTING PASS ${passId} (Safe: ${isSafeMode}) ---`);
     const wasmUrl = new URL('/wasm-files/web-demuxer.wasm', window.location.origin).href;
     
     let encoder: VideoEncoder | null = null;
     let audioEncoder: AudioEncoder | null = null;
-    let muxer: Muxer<ArrayBufferTarget> | null = null;
+    let output: Output | null = null;
+    let videoSource: EncodedVideoPacketSource | null = null;
+    let audioSource: EncodedAudioPacketSource | null = null;
 
-    let engineReject: (err: any) => void;
+    let engineReject: (err: Error) => void;
     const enginePromise = new Promise<void>((_, reject) => { engineReject = reject; });
 
     const checkFatal = () => {
@@ -246,21 +258,31 @@ function App() {
 
       // 2. Output Muxer
       const finalCodec = isSafeMode ? 'avc' : ((targetCodec.startsWith('hev') || targetCodec.startsWith('hvc')) ? 'hevc' : 'avc');
-      muxer = new Muxer({
-        target: new ArrayBufferTarget(),
-        video: { codec: finalCodec, width: targetWidth, height: targetHeight },
-        audio: targetAudioConfig ? { 
-          codec: 'aac', 
-          sampleRate: 44100, // Standardize to 44.1kHz for robustness
-          numberOfChannels: 2 
-        } : undefined,
-        fastStart: 'in-memory',
-        firstTimestampBehavior: 'offset' // Ensure it starts at 0
+      output = new Output({
+        format: new Mp4OutputFormat({ fastStart: 'reserve' }),
+        target
       });
+
+      videoSource = new EncodedVideoPacketSource(finalCodec === 'hevc' ? 'hevc' : 'avc');
+      output.addVideoTrack(videoSource);
+
+      if (targetAudioConfig) {
+        audioSource = new EncodedAudioPacketSource('aac');
+        output.addAudioTrack(audioSource);
+      }
+
+      await output.start();
 
       // 3. Setup Encoders
       encoder = new VideoEncoder({
-        output: (chunk, meta) => muxer!.addVideoChunk(chunk, meta),
+        output: (chunk, meta) => {
+          const packet = EncodedPacket.fromEncodedChunk(chunk);
+          if (meta?.decoderConfig) {
+            videoSource!.add(packet, { decoderConfig: meta.decoderConfig });
+          } else {
+            videoSource!.add(packet);
+          }
+        },
         error: (e) => engineReject(new Error(`Encoder rejection: ${e.message}`))
       });
 
@@ -281,8 +303,8 @@ function App() {
         const finalVConfig = vSupport.supported && !isSafeMode ? vConfig : { ...vConfig, hardwareAcceleration: 'prefer-software' as const };
         encoder.configure(finalVConfig);
         console.log('[Init] VideoEncoder Configured:', finalVConfig.codec, finalVConfig.hardwareAcceleration);
-      } catch (e: any) {
-        console.error('[Init] Encoder Configuration Failed. Trying ultra-safe Baseline fallback.', e);
+      } catch (e) {
+        console.error('[Init] Encoder Configuration Failed. Trying ultra-safe Baseline fallback.', e instanceof Error ? e.message : String(e));
         // Ultra-safe fallback: Baseline Level 4.0 (1080p)
         encoder.configure({
           codec: 'avc1.42E028',
@@ -293,7 +315,14 @@ function App() {
 
       if (targetAudioConfig) {
         audioEncoder = new AudioEncoder({
-          output: (chunk, meta) => muxer!.addAudioChunk(chunk, meta),
+          output: (chunk, meta) => {
+            const packet = EncodedPacket.fromEncodedChunk(chunk);
+            if (meta?.decoderConfig) {
+              audioSource!.add(packet, { decoderConfig: meta.decoderConfig });
+            } else {
+              audioSource!.add(packet);
+            }
+          },
           error: (e) => engineReject(new Error(`AudioEncoder rejection: ${e.message}`))
         });
         audioEncoder.configure({ 
@@ -304,13 +333,33 @@ function App() {
         });
       }
 
-      // 4. Main Processing Loop
+            // 4. Main Processing Loop
       let accumulatedTimeMicros = 0;
       let accumulatedAudioTimeMicros = 0;
       let lastVideoTs = -1;
       let lastAudioTs = -1;
       const canvas = new OffscreenCanvas(targetWidth, targetHeight);
       const ctx = canvas.getContext('2d', { alpha: false })!;
+
+      // Backpressure resolvers
+      let vEncodeResolve: (() => void) | null = null;
+      let aEncodeResolve: (() => void) | null = null;
+
+      encoder.ondequeue = () => {
+        if (vEncodeResolve && encoder!.encodeQueueSize < 10) {
+          vEncodeResolve();
+          vEncodeResolve = null;
+        }
+      };
+
+      if (audioEncoder) {
+        audioEncoder.ondequeue = () => {
+          if (aEncodeResolve && audioEncoder!.encodeQueueSize < 10) {
+            aEncodeResolve();
+            aEncodeResolve = null;
+          }
+        };
+      }
 
       const loop = async () => {
         for (let i = 0; i < videos.length; i++) {
@@ -372,10 +421,17 @@ function App() {
               try {
                 while (true) {
                   checkFatal();
-                  if (decoder.decodeQueueSize > 4 || (encoder && encoder.encodeQueueSize > 4)) {
+                  
+                  // Backpressure handling: wait if encoder queue is full
+                  if (encoder && encoder.encodeQueueSize > 30) {
+                    await new Promise<void>(r => { vEncodeResolve = r; });
+                  }
+                  // Backpressure handling: wait if decoder queue is full
+                  if (decoder.decodeQueueSize > 10) {
                     await new Promise(r => setTimeout(r, 10));
                     continue;
                   }
+
                   const { done, value: chunk } = await reader.read();
                   if (done) break;
                   decoder.decode(chunk);
@@ -453,7 +509,7 @@ function App() {
                         numberOfFrames: data.numberOfFrames,
                         numberOfChannels: data.numberOfChannels,
                         timestamp: ts,
-                        data: buffer as any
+                        data: buffer as unknown as ArrayBuffer
                       });
                     }
                     
@@ -470,10 +526,17 @@ function App() {
               try {
                 while (true) {
                   checkFatal();
-                  if (audioDecoder.decodeQueueSize > 4 || (audioEncoder && audioEncoder.encodeQueueSize > 4)) {
+                  
+                  // Backpressure handling: wait if audio encoder queue is full
+                  if (audioEncoder && audioEncoder.encodeQueueSize > 30) {
+                    await new Promise<void>(r => { aEncodeResolve = r; });
+                  }
+                  // Backpressure handling: wait if audio decoder queue is full
+                  if (audioDecoder.decodeQueueSize > 10) {
                     await new Promise(r => setTimeout(r, 10));
                     continue;
                   }
+                  /* redundant check removed */
                   const { done, value: chunk } = await reader.read();
                   if (done) break;
                   audioDecoder.decode(chunk);
@@ -499,19 +562,24 @@ function App() {
         checkFatal();
         await encoder!.flush();
         if (audioEncoder) await audioEncoder.flush();
-        muxer!.finalize();
+        await output!.finalize();
         
-        const { buffer } = muxer!.target as ArrayBufferTarget;
-        const downloadUrl = URL.createObjectURL(new Blob([buffer], { type: 'video/mp4' }));
-        const a = document.createElement('a'); a.href = downloadUrl; a.download = 'stitched_video.mp4'; a.click();
+        if (target instanceof BufferTarget) {
+          const buffer = target.buffer;
+          if (buffer) {
+            const downloadUrl = URL.createObjectURL(new Blob([buffer], { type: 'video/mp4' }));
+            const a = document.createElement('a'); a.href = downloadUrl; a.download = 'stitched_video.mp4'; a.click();
+          }
+        }
+
         updateUI(passId, 'Finished!', 100); setIsDone(true);
       };
 
       await Promise.race([loop(), enginePromise]);
 
     } finally {
-      if (encoder && encoder.state !== 'closed') try { encoder.close(); } catch {}
-      if (audioEncoder && audioEncoder.state !== 'closed') try { audioEncoder.close(); } catch {}
+      if (encoder && encoder.state !== 'closed') try { encoder.close(); } catch { /* ignore */ }
+      if (audioEncoder && audioEncoder.state !== 'closed') try { audioEncoder.close(); } catch { /* ignore */ }
     }
   };
 
@@ -519,15 +587,15 @@ function App() {
    * The UI wrapper.
    */
   const abortControllerRef = useRef<AbortController | null>(null);
-  const wakeLockRef = useRef<any>(null);
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
 
   const requestWakeLock = async () => {
     if ('wakeLock' in navigator) {
       try {
-        wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
+        wakeLockRef.current = await (navigator as unknown as { wakeLock: { request: (type: string) => Promise<WakeLockSentinel> } }).wakeLock.request('screen');
         console.log('[System] Screen Wake Lock acquired.');
-      } catch (err: any) {
-        console.warn('[System] Wake Lock failed:', err.message);
+      } catch (err) {
+        console.warn('[System] Wake Lock failed:', err instanceof Error ? err.message : String(err));
       }
     }
   };
@@ -538,8 +606,8 @@ function App() {
         await wakeLockRef.current.release();
         wakeLockRef.current = null;
         console.log('[System] Screen Wake Lock released.');
-      } catch (err: any) {
-        console.error('[System] Wake Lock release error:', err.message);
+      } catch (err) {
+        console.error('[System] Wake Lock release error:', err instanceof Error ? err.message : String(err));
       }
     }
   };
@@ -557,6 +625,25 @@ function App() {
   const handleConcatenate = async () => {
     if (videos.length < 2) { setError('Please add at least 2 videos.'); return; }
     
+    let diskTarget: StreamTarget | null = null;
+    if (streamToDisk) {
+      try {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName: 'stitched_video.mp4',
+          types: [{
+            description: 'Video File',
+            accept: { 'video/mp4': ['.mp4'] }
+          }]
+        });
+        const writable = await handle.createWritable();
+        diskTarget = new StreamTarget(writable, { chunked: true });
+      } catch (err: any) {
+        if (err.name === 'AbortError') return;
+        setError(`Failed to start disk stream: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+    }
+
     setProcessing(true);
     setError(null);
     setIsDone(false);
@@ -574,14 +661,14 @@ function App() {
       globalErrorFlag.current = null;
       
       try {
-        await runStitchEngine(isSafe, passId, signal);
-      } catch (err: any) {
+        const target = diskTarget || new BufferTarget();
+        await runStitchEngine(isSafe, passId, signal, target);
+      } catch (err) {
         if (passId !== currentPassId.current) return;
 
-        const realError = globalErrorFlag.current || err;
-
+        const realError = globalErrorFlag.current || (err instanceof Error ? err : new Error(String(err)));
         if (!isSafe) {
-          console.warn(`[Pass ${passId}] Failed. Retrying in Compatibility Mode...`, realError);
+          console.warn(`[Pass ${passId}] Failed. Retrying in Compatibility Mode...`, realError.message);
           updateUI(passId, 'Hardware rejection detected. Switching to Compatibility Mode...', 0);
           await new Promise(r => setTimeout(r, 1500));
           return startPass(true);
@@ -802,6 +889,24 @@ function App() {
 
       {videos.length > 0 && !isDone && (
         <div className={styles.controls}>
+          {!processing && canStreamToDisk && (
+            <label style={{ 
+              display: 'flex', 
+              alignItems: 'center', 
+              gap: '0.5rem', 
+              fontSize: '0.875rem', 
+              color: '#64748b', 
+              cursor: 'pointer',
+              marginBottom: '0.5rem'
+            }}>
+              <input 
+                type="checkbox" 
+                checked={streamToDisk} 
+                onChange={(e) => setStreamToDisk(e.target.checked)} 
+              />
+              <span>Stream to Disk (Recommended for large files)</span>
+            </label>
+          )}
           <button
             onClick={() => handleConcatenate()}
             disabled={processing || videos.length < 2}

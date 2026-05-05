@@ -7,7 +7,9 @@ test('should support 1080p resolution in Compatibility Mode', async ({ page }) =
   // Mock a 1080p failure on the first pass
   await page.addInitScript(() => {
     let globalPassCount = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const OriginalWebDemuxer = (window as any).WebDemuxer;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (window as any).WebDemuxer = class extends OriginalWebDemuxer {
       async getDecoderConfig(type: string) {
         const config = await super.getDecoderConfig(type);
@@ -19,8 +21,9 @@ test('should support 1080p resolution in Compatibility Mode', async ({ page }) =
     };
 
     const OriginalVideoEncoder = window.VideoEncoder;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (window as any).VideoEncoder = class extends OriginalVideoEncoder {
-      configure(config: any) {
+      configure(config: VideoEncoderConfig) {
         globalPassCount++;
         // Fail the first pass to trigger retry
         if (globalPassCount === 1) throw new Error('Simulated HW Failure');
