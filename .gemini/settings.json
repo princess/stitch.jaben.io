@@ -14,18 +14,6 @@
         "@playwright/mcp@latest"
       ]
     },
-    "serena": {
-      "command": "/Users/princess/.local/bin/uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/oraios/serena",
-        "serena",
-        "start-mcp-server",
-        "--context",
-        "claude-code",
-        "--project-from-cwd"
-      ]
-    },
     "sequential-thinking": {
       "command": "npx",
       "args": [
