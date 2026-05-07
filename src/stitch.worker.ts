@@ -150,7 +150,7 @@ self.onmessage = async (e) => {
 
         // 1. Pre-flight (Adaptive Clock + Normalization)
         let targetWidth = 0, targetHeight = 0, targetCodec = 'avc', targetAudioConfig: AudioDecoderConfig | null = null;
-        let firstVideoConfig: VideoDecoderConfig | null = null, firstAudioConfig: AudioDecoderConfig | null = null;
+        let firstVideoConfig: VideoDecoderConfig | null = null, firstAudioConfig: AudioDecoderConfig | null | undefined = undefined;
         let canFastPath = true, maxFrameRate = 30;
         let originalMetadata: any = null;
         const videoMetadata: { duration: number, peak: number }[] = [];
@@ -169,20 +169,26 @@ self.onmessage = async (e) => {
                const fps = videoStream.codec_string.includes('60') ? 60 : 30;
                maxFrameRate = Math.max(maxFrameRate, fps);
             }
+            
+            if (aConfig && !targetAudioConfig) {
+               targetAudioConfig = aConfig;
+            }
 
             if (i === 0) {
               firstVideoConfig = vConfig;
-              firstAudioConfig = aConfig;
+              firstAudioConfig = aConfig; // Explicitly track what clip 0 had
               targetWidth = Math.floor(vConfig.codedWidth! / 2) * 2;
               targetHeight = Math.floor(vConfig.codedHeight! / 2) * 2;
               targetCodec = vConfig.codec.startsWith('hev') ? 'hevc' : 'avc';
-              targetAudioConfig = aConfig;
               try { originalMetadata = { date: new Date(), title: `Stitched on Pixel 6`, raw: { 'com.apple.quicktime.description': 'Processed by Stitch Engine' } }; } catch {}
             } else {
               const vMatch = vConfig.codec === firstVideoConfig!.codec && vConfig.codedWidth === firstVideoConfig!.codedWidth &&
                              vConfig.codedHeight === firstVideoConfig!.codedHeight && buffersEqual(vConfig.description as ArrayBuffer, firstVideoConfig!.description as ArrayBuffer);
-              const aMatch = (!aConfig && !firstAudioConfig) || (aConfig && firstAudioConfig && aConfig.codec === firstAudioConfig.codec && 
-                             aConfig.sampleRate === firstAudioConfig.sampleRate && aConfig.numberOfChannels === firstAudioConfig.numberOfChannels);
+              
+              const audioPresenceMatch = (aConfig !== null) === (firstAudioConfig !== null);
+              const aMatch = audioPresenceMatch && (!aConfig || (aConfig.codec === firstAudioConfig!.codec && 
+                             aConfig.sampleRate === firstAudioConfig!.sampleRate && aConfig.numberOfChannels === firstAudioConfig!.numberOfChannels));
+              
               if (!vMatch || !aMatch) canFastPath = false;
             }
 
