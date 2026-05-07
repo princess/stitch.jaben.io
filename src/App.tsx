@@ -532,7 +532,27 @@ function App() {
           }
 
           if (payload) {
-             const downloadUrl = URL.createObjectURL(new Blob([payload], { type: 'video/mp4' }));
+             const blob = new Blob([payload], { type: 'video/mp4' });
+             const downloadUrl = URL.createObjectURL(blob);
+             
+             // TRUST VERIFICATION: Probe the output
+             try {
+               const wasmUrl = getAppWasmUrl();
+               const probeDemuxer = new DefaultWebDemuxer({ wasmFilePath: wasmUrl });
+               await probeDemuxer.load(new File([blob], 'stitched.mp4'));
+               const info = await probeDemuxer.getMediaInfo();
+               const hasAudio = info.streams.some(s => s.codec_type_string === 'audio');
+               if (hasAudio) {
+                 console.log('[System] Verification SUCCESS: Audio track found in output.');
+               } else {
+                 console.warn('[System] Verification FAILURE: No audio track found in output.');
+                 setError('Warning: The stitched video was generated without an audio track. Please check if your source videos have audio.');
+               }
+               await probeDemuxer.destroy();
+             } catch (e) {
+               console.warn('[System] Verification skipped:', e);
+             }
+
              const a = document.createElement('a'); a.href = downloadUrl; a.download = 'stitched_video.mp4'; a.click();
           }
           

@@ -176,7 +176,7 @@ self.onmessage = async (e) => {
 
             if (i === 0) {
               firstVideoConfig = vConfig;
-              firstAudioConfig = aConfig; // Explicitly track what clip 0 had
+              firstAudioConfig = aConfig; 
               targetWidth = Math.floor(vConfig.codedWidth! / 2) * 2;
               targetHeight = Math.floor(vConfig.codedHeight! / 2) * 2;
               targetCodec = vConfig.codec.startsWith('hev') ? 'hevc' : 'avc';
@@ -232,7 +232,13 @@ self.onmessage = async (e) => {
         const videoSource = new EncodedVideoPacketSource(targetCodec === 'hevc' ? 'hevc' : 'avc');
         output.addVideoTrack(videoSource);
         let audioSource: EncodedAudioPacketSource | null = null;
-        if (targetAudioConfig) { audioSource = new EncodedAudioPacketSource('aac'); output.addAudioTrack(audioSource); }
+        if (targetAudioConfig) { 
+          addLog('[Muxer] Initializing Audio Track (AAC).');
+          audioSource = new EncodedAudioPacketSource('aac'); 
+          output.addAudioTrack(audioSource); 
+        } else {
+          addLog('[Muxer] No Audio Track initialized (Grid is silent).');
+        }
         if (originalMetadata) output.setMetadataTags(originalMetadata);
         await output.start();
 
@@ -260,9 +266,18 @@ self.onmessage = async (e) => {
           if (targetAudioConfig && audioSource) {
             audioEncoder = new AudioEncoder({
               output: (chunk, meta) => {
-                const packet = EncodedPacket.fromEncodedChunk(chunk).clone({ timestamp: chunk.timestamp / 1000000 });
-                if (meta?.decoderConfig) audioSource!.add(packet, { decoderConfig: meta.decoderConfig });
-                else audioSource!.add(packet);
+                const packet = EncodedPacket.fromEncodedChunk(chunk).clone({ 
+                  timestamp: chunk.timestamp / 1000000,
+                  duration: (chunk.duration || 0) / 1000000
+                });
+                const packetMeta: any = {};
+                if (meta?.decoderConfig) {
+                  packetMeta.decoderConfig = {
+                    ...meta.decoderConfig,
+                    description: meta.decoderConfig.description ? new Uint8Array(meta.decoderConfig.description as any) : undefined
+                  };
+                }
+                audioSource!.add(packet, packetMeta);
               },
               error: (e) => self.postMessage({ type: 'ERROR', payload: `AudioEncoder: ${e.message}` })
             });
@@ -337,7 +352,6 @@ self.onmessage = async (e) => {
             const processAudio = async () => {
               if (!audioSource) return;
               
-              // ATOMIC PEAK: Silence Injection
               if (!currentAudioConfig) {
                 addLog(`[Audio] Injecting silence for clip ${i} to maintain sync.`);
                 const silenceDuration = videoDuration || 0;
@@ -357,14 +371,23 @@ self.onmessage = async (e) => {
                   while (true) {
                     checkFatal(); const { done, value: chunk } = await reader.read(); if (done) break;
                     const adjusted = EncodedPacket.fromEncodedChunk(chunk).clone({ timestamp: (accumulatedTimeMicros + chunk.timestamp) / 1000000 });
-                    audioSource!.add(adjusted, (audioCount === 0 && currentAudioConfig) ? { decoderConfig: currentAudioConfig } : undefined); 
+                    const meta: any = {};
+                    if (audioCount === 0) {
+                      meta.decoderConfig = {
+                        ...currentAudioConfig,
+                        description: currentAudioConfig.description ? new Uint8Array(currentAudioConfig.description as any) : undefined
+                      };
+                    }
+                    audioSource!.add(adjusted, meta); 
                     clipAudioMaxTime = Math.max(clipAudioMaxTime, (chunk.timestamp + (chunk.duration || 0)));
                     audioCount++;
                   }
+                  addLog(`[Audio] FastPath Clip ${i} added ${audioCount} packets.`);
                 } else {
                   if (!audioEncoder) return;
                   let offset: number | null = null;
-                  const FADE_MICROS = 30000; // 30ms fade
+                  let audioCount = 0;
+                  const FADE_MICROS = 30000;
                   const audioDecoder = new AudioDecoder({
                     output: (data) => {
                       if (offset === null) offset = data.timestamp;
@@ -388,6 +411,7 @@ self.onmessage = async (e) => {
                         }
                         const finalData = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: newFrames, numberOfChannels: 2, timestamp: ts, data: interleaved.slice() });
                         audioEncoder!.encode(finalData); finalData.close();
+                        audioCount++;
                       }
                       clipAudioMaxTime = Math.max(clipAudioMaxTime, (ts - accumulatedTimeMicros) + (data.duration || 0)); data.close();
                     },
@@ -400,6 +424,7 @@ self.onmessage = async (e) => {
                     const { done, value: chunk } = await reader.read(); if (done) break; audioDecoder.decode(chunk);
                   }
                   await audioDecoder.flush(); audioDecoder.close();
+                  addLog(`[Audio] SlowPath Clip ${i} encoded ${audioCount} buffers.`);
                 }
               } catch (err) {
                 addLog(`[Audio] Warning: Clip ${i} audio failed: ${err instanceof Error ? err.message : String(err)}`);
