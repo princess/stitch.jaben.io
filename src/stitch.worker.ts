@@ -150,37 +150,40 @@ self.onmessage = async (e) => {
 
         // 1. Pre-flight (Adaptive Clock + Normalization)
         let targetWidth = 0, targetHeight = 0, targetCodec = 'avc', targetAudioConfig: AudioDecoderConfig | null = null;
-        let firstVideoConfig: VideoDecoderConfig | null = null, canFastPath = true, globalPeak = 0, maxFrameRate = 30;
+        let firstVideoConfig: VideoDecoderConfig | null = null, firstAudioConfig: AudioDecoderConfig | null = null;
+        let canFastPath = true, maxFrameRate = 30;
         let originalMetadata: any = null;
+        const videoMetadata: { duration: number, peak: number }[] = [];
 
         updateUI('Analyzing media grid...', 0);
         for (let i = 0; i < videos.length; i++) {
           const demuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
+          let clipPeak = 0;
           try {
             await demuxer.load(videos[i].file);
             const vConfig = await demuxer.getDecoderConfig('video');
             const aConfig = await demuxer.getDecoderConfig('audio').catch(() => null);
-            const streams = (await demuxer.getMediaInfo()).streams;
-            const videoStream = streams.find(s => s.codec_type_string === 'video');
+            const mediaInfo = await demuxer.getMediaInfo();
+            const videoStream = mediaInfo.streams.find(s => s.codec_type_string === 'video');
             if (videoStream) {
-               // Extract framerate: usually coded as string like "60/1" or similar
-               // This is a rough estimation for adaptive clock
                const fps = videoStream.codec_string.includes('60') ? 60 : 30;
                maxFrameRate = Math.max(maxFrameRate, fps);
             }
 
             if (i === 0) {
               firstVideoConfig = vConfig;
+              firstAudioConfig = aConfig;
               targetWidth = Math.floor(vConfig.codedWidth! / 2) * 2;
               targetHeight = Math.floor(vConfig.codedHeight! / 2) * 2;
               targetCodec = vConfig.codec.startsWith('hev') ? 'hevc' : 'avc';
               targetAudioConfig = aConfig;
               try { originalMetadata = { date: new Date(), title: `Stitched on Pixel 6`, raw: { 'com.apple.quicktime.description': 'Processed by Stitch Engine' } }; } catch {}
             } else {
-              if (vConfig.codec !== firstVideoConfig!.codec || vConfig.codedWidth !== firstVideoConfig!.codedWidth ||
-                  vConfig.codedHeight !== firstVideoConfig!.codedHeight || !buffersEqual(vConfig.description as ArrayBuffer, firstVideoConfig!.description as ArrayBuffer)) {
-                canFastPath = false;
-              }
+              const vMatch = vConfig.codec === firstVideoConfig!.codec && vConfig.codedWidth === firstVideoConfig!.codedWidth &&
+                             vConfig.codedHeight === firstVideoConfig!.codedHeight && buffersEqual(vConfig.description as ArrayBuffer, firstVideoConfig!.description as ArrayBuffer);
+              const aMatch = (!aConfig && !firstAudioConfig) || (aConfig && firstAudioConfig && aConfig.codec === firstAudioConfig.codec && 
+                             aConfig.sampleRate === firstAudioConfig.sampleRate && aConfig.numberOfChannels === firstAudioConfig.numberOfChannels);
+              if (!vMatch || !aMatch) canFastPath = false;
             }
 
             if (aConfig) {
@@ -188,7 +191,7 @@ self.onmessage = async (e) => {
               const audioDecoder = new AudioDecoder({
                 output: (data) => {
                   const p0 = new Float32Array(data.numberOfFrames); data.copyTo(p0, { planeIndex: 0 });
-                  for (let val of p0) globalPeak = Math.max(globalPeak, Math.abs(val));
+                  for (let val of p0) clipPeak = Math.max(clipPeak, Math.abs(val));
                   data.close();
                 },
                 error: () => {}
@@ -197,12 +200,12 @@ self.onmessage = async (e) => {
               for (let j = 0; j < 50; j++) { const { done, value } = await reader.read(); if (done) break; audioDecoder.decode(value); }
               await audioDecoder.flush(); audioDecoder.close(); reader.releaseLock();
             }
+            videoMetadata.push({ duration: mediaInfo.duration || 0, peak: clipPeak });
             targetWidth = Math.max(targetWidth, Math.floor(vConfig.codedWidth! / 2) * 2);
             targetHeight = Math.max(targetHeight, Math.floor(vConfig.codedHeight! / 2) * 2);
           } finally { await demuxer.destroy(); }
         }
 
-        const audioGain = globalPeak > 0 ? Math.min(2.0, 0.9 / globalPeak) : 1.0;
         if (canFastPath) addLog('[FastPath] ENABLED.');
         addLog(`[Clock] Adaptive Master Clock: ${maxFrameRate}fps.`);
 
@@ -232,7 +235,7 @@ self.onmessage = async (e) => {
         if (!canFastPath) {
           encoder = new VideoEncoder({
             output: (chunk, meta) => {
-              const packet = EncodedPacket.fromEncodedChunk(chunk);
+              const packet = EncodedPacket.fromEncodedChunk(chunk).clone({ timestamp: chunk.timestamp / 1000000 });
               if (meta?.decoderConfig) videoSource.add(packet, { decoderConfig: meta.decoderConfig });
               else videoSource.add(packet);
             },
@@ -251,7 +254,7 @@ self.onmessage = async (e) => {
           if (targetAudioConfig && audioSource) {
             audioEncoder = new AudioEncoder({
               output: (chunk, meta) => {
-                const packet = EncodedPacket.fromEncodedChunk(chunk);
+                const packet = EncodedPacket.fromEncodedChunk(chunk).clone({ timestamp: chunk.timestamp / 1000000 });
                 if (meta?.decoderConfig) audioSource!.add(packet, { decoderConfig: meta.decoderConfig });
                 else audioSource!.add(packet);
               },
@@ -280,6 +283,8 @@ self.onmessage = async (e) => {
             const videoDuration = mediaInfo.duration;
             let currentAudioConfig: AudioDecoderConfig | null = await demuxer.getDecoderConfig('audio').catch(() => null);
             let clipVideoMaxTime = 0, clipAudioMaxTime = 0, frameCount = 0;
+            const clipPeak = videoMetadata[i].peak;
+            const clipGain = clipPeak > 0 ? Math.min(2.0, 0.9 / clipPeak) : 1.0;
 
             const processVideo = async () => {
               const reader = demuxer.read('video').getReader();
@@ -288,7 +293,7 @@ self.onmessage = async (e) => {
                   while (true) {
                     checkFatal(); const { done, value: chunk } = await reader.read(); if (done) break;
                     const adjusted = EncodedPacket.fromEncodedChunk(chunk).clone({ timestamp: (accumulatedTimeMicros + (frameCount * frameInterval)) / 1000000 });
-                    videoSource.add(adjusted, (i === 0 && frameCount === 0) ? { decoderConfig: firstVideoConfig! } : undefined);
+                    videoSource.add(adjusted, (frameCount === 0) ? { decoderConfig: videoConfig } : undefined);
                     frameCount++; clipVideoMaxTime = Math.max(clipVideoMaxTime, (frameCount * frameInterval));
                     if (frameCount % 60 === 0) updateUI(undefined, Math.round(((i + Math.min(1, frameCount / (videoDuration * (1000000 / frameInterval)))) / videos.length) * 90));
                   }
@@ -325,18 +330,35 @@ self.onmessage = async (e) => {
 
             const processAudio = async () => {
               if (!audioSource) return;
+              
+              // ATOMIC PEAK: Silence Injection
+              if (!currentAudioConfig) {
+                addLog(`[Audio] Injecting silence for clip ${i} to maintain sync.`);
+                const silenceDuration = videoDuration || 0;
+                if (audioEncoder && !canFastPath) {
+                   const frames = Math.floor((silenceDuration / 1000000) * 44100);
+                   const silence = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: frames, numberOfChannels: 2, timestamp: accumulatedTimeMicros, data: new Float32Array(frames * 2) });
+                   audioEncoder.encode(silence); silence.close();
+                }
+                clipAudioMaxTime = silenceDuration;
+                return;
+              }
+
               const reader = demuxer.read('audio').getReader();
               try {
                 if (canFastPath) {
+                  let audioCount = 0;
                   while (true) {
                     checkFatal(); const { done, value: chunk } = await reader.read(); if (done) break;
                     const adjusted = EncodedPacket.fromEncodedChunk(chunk).clone({ timestamp: (accumulatedTimeMicros + chunk.timestamp) / 1000000 });
-                    audioSource!.add(adjusted, (i === 0 && chunk.timestamp === 0) ? { decoderConfig: targetAudioConfig! } : undefined); 
+                    audioSource!.add(adjusted, (audioCount === 0 && currentAudioConfig) ? { decoderConfig: currentAudioConfig } : undefined); 
                     clipAudioMaxTime = Math.max(clipAudioMaxTime, (chunk.timestamp + (chunk.duration || 0)));
+                    audioCount++;
                   }
                 } else {
-                  if (!audioEncoder || !currentAudioConfig) return;
+                  if (!audioEncoder) return;
                   let offset: number | null = null;
+                  const FADE_MICROS = 30000; // 30ms fade
                   const audioDecoder = new AudioDecoder({
                     output: (data) => {
                       if (offset === null) offset = data.timestamp;
@@ -348,9 +370,14 @@ self.onmessage = async (e) => {
                         for (let j = 0; j < data.numberOfChannels; j++) data.copyTo(audioBufferPool.getPlane(j, data.numberOfFrames), { planeIndex: j });
                         for (let j = 0; j < newFrames; j++) {
                           const srcIdx = j * ratio, idx1 = Math.floor(srcIdx), idx2 = Math.min(idx1 + 1, data.numberOfFrames - 1), weight = srcIdx - idx1;
+                          let fadeGain = 1.0;
+                          const relTs = ts - accumulatedTimeMicros;
+                          if (relTs < FADE_MICROS) fadeGain = relTs / FADE_MICROS;
+                          else if (videoDuration && (videoDuration - relTs) < FADE_MICROS) fadeGain = (videoDuration - relTs) / FADE_MICROS;
+
                           for (let ch = 0; ch < 2; ch++) {
                             const p = audioBufferPool.getPlane(ch % data.numberOfChannels, data.numberOfFrames);
-                            interleaved[j * 2 + ch] = (p[idx1] * (1 - weight) + p[idx2] * weight) * audioGain;
+                            interleaved[j * 2 + ch] = (p[idx1] * (1 - weight) + p[idx2] * weight) * clipGain * fadeGain;
                           }
                         }
                         const finalData = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: newFrames, numberOfChannels: 2, timestamp: ts, data: interleaved.slice() });
@@ -369,7 +396,6 @@ self.onmessage = async (e) => {
                   await audioDecoder.flush(); audioDecoder.close();
                 }
               } catch (err) {
-                // If audio fails for one clip, we still want to continue with others
                 addLog(`[Audio] Warning: Clip ${i} audio failed: ${err instanceof Error ? err.message : String(err)}`);
               } finally { reader.releaseLock(); }
             };
