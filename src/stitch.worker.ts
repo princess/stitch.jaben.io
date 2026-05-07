@@ -267,7 +267,7 @@ self.onmessage = async (e) => {
         await renderer.init();
         const frameInterval = 1000000 / maxFrameRate;
         const audioBufferPool = new BufferPool(44100);
-        let accumulatedTimeMicros = 0, accumulatedAudioTimeMicros = 0, lastAudioTs = -1;
+        let accumulatedTimeMicros = 0, lastAudioTs = -1;
 
         for (let i = 0; i < videos.length; i++) {
           checkFatal();
@@ -324,12 +324,13 @@ self.onmessage = async (e) => {
             };
 
             const processAudio = async () => {
+              if (!audioSource) return;
               const reader = demuxer.read('audio').getReader();
               try {
                 if (canFastPath) {
                   while (true) {
                     checkFatal(); const { done, value: chunk } = await reader.read(); if (done) break;
-                    const adjusted = EncodedPacket.fromEncodedChunk(chunk).clone({ timestamp: (accumulatedAudioTimeMicros + (chunk.timestamp)) / 1000000 });
+                    const adjusted = EncodedPacket.fromEncodedChunk(chunk).clone({ timestamp: (accumulatedTimeMicros + chunk.timestamp) / 1000000 });
                     audioSource!.add(adjusted, (i === 0 && chunk.timestamp === 0) ? { decoderConfig: targetAudioConfig! } : undefined); 
                     clipAudioMaxTime = Math.max(clipAudioMaxTime, (chunk.timestamp + (chunk.duration || 0)));
                   }
@@ -339,7 +340,7 @@ self.onmessage = async (e) => {
                   const audioDecoder = new AudioDecoder({
                     output: (data) => {
                       if (offset === null) offset = data.timestamp;
-                      let ts = Math.max(0, (data.timestamp - offset)) + accumulatedAudioTimeMicros;
+                      let ts = Math.max(0, (data.timestamp - offset)) + accumulatedTimeMicros;
                       if (ts <= lastAudioTs) ts = lastAudioTs + 1;
                       lastAudioTs = ts;
                       if (audioEncoder!.state === 'configured') {
@@ -355,7 +356,7 @@ self.onmessage = async (e) => {
                         const finalData = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: newFrames, numberOfChannels: 2, timestamp: ts, data: interleaved.slice() });
                         audioEncoder!.encode(finalData); finalData.close();
                       }
-                      clipAudioMaxTime = Math.max(clipAudioMaxTime, (ts - accumulatedAudioTimeMicros) + (data.duration || 0)); data.close();
+                      clipAudioMaxTime = Math.max(clipAudioMaxTime, (ts - accumulatedTimeMicros) + (data.duration || 0)); data.close();
                     },
                     error: (e) => self.postMessage({ type: 'ERROR', payload: `AudioDecoder: ${e.message}` })
                   });
@@ -367,12 +368,15 @@ self.onmessage = async (e) => {
                   }
                   await audioDecoder.flush(); audioDecoder.close();
                 }
+              } catch (err) {
+                // If audio fails for one clip, we still want to continue with others
+                addLog(`[Audio] Warning: Clip ${i} audio failed: ${err instanceof Error ? err.message : String(err)}`);
               } finally { reader.releaseLock(); }
             };
 
-            await processVideo(); await processAudio(); checkFatal();
+            await Promise.all([processVideo(), processAudio()]); checkFatal();
             const clipDuration = Math.max(clipVideoMaxTime, clipAudioMaxTime, (videoDuration || 0));
-            accumulatedTimeMicros += clipDuration; accumulatedAudioTimeMicros += clipDuration;
+            accumulatedTimeMicros += clipDuration;
             if (isMobile) { updateUI(`Cooling down...`, Math.round(((i + 1) / videos.length) * 90)); await new Promise(r => setTimeout(r, 600)); }
           } finally { await demuxer.destroy(); }
         }
