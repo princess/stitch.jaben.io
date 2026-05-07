@@ -265,7 +265,7 @@ self.onmessage = async (e) => {
 
           if (targetAudioConfig && audioSource) {
             audioEncoder = new AudioEncoder({
-              output: (chunk, meta) => {
+              output: async (chunk, meta) => {
                 const packet = EncodedPacket.fromEncodedChunk(chunk).clone({ 
                   timestamp: chunk.timestamp / 1000000,
                   duration: (chunk.duration || 0) / 1000000
@@ -277,7 +277,7 @@ self.onmessage = async (e) => {
                     description: meta.decoderConfig.description ? new Uint8Array(meta.decoderConfig.description as any) : undefined
                   };
                 }
-                audioSource!.add(packet, packetMeta);
+                await audioSource!.add(packet, packetMeta);
               },
               error: (e) => self.postMessage({ type: 'ERROR', payload: `AudioEncoder: ${e.message}` })
             });
@@ -314,14 +314,14 @@ self.onmessage = async (e) => {
                   while (true) {
                     checkFatal(); const { done, value: chunk } = await reader.read(); if (done) break;
                     const adjusted = EncodedPacket.fromEncodedChunk(chunk).clone({ timestamp: (accumulatedTimeMicros + (frameCount * frameInterval)) / 1000000 });
-                    videoSource.add(adjusted, (frameCount === 0) ? { decoderConfig: videoConfig } : undefined);
+                    await videoSource.add(adjusted, (frameCount === 0) ? { decoderConfig: videoConfig } : undefined);
                     frameCount++; clipVideoMaxTime = Math.max(clipVideoMaxTime, (frameCount * frameInterval));
                     if (frameCount % 60 === 0) updateUI(undefined, Math.round(((i + Math.min(1, frameCount / (videoDuration * (1000000 / frameInterval)))) / videos.length) * 90));
                   }
                 } else {
                   let offset: number | null = null;
                   const decoder = new VideoDecoder({
-                    output: (frame) => {
+                    output: async (frame) => {
                       if (offset === null) offset = frame.timestamp;
                       const ts = accumulatedTimeMicros + (frameCount * frameInterval);
                       if (renderer.isSupported) renderer.render(frame, targetWidth, targetHeight);
@@ -378,7 +378,7 @@ self.onmessage = async (e) => {
                         description: currentAudioConfig.description ? new Uint8Array(currentAudioConfig.description as any) : undefined
                       };
                     }
-                    audioSource!.add(adjusted, meta); 
+                    await audioSource!.add(adjusted, meta); 
                     clipAudioMaxTime = Math.max(clipAudioMaxTime, (chunk.timestamp + (chunk.duration || 0)));
                     audioCount++;
                   }
@@ -439,8 +439,8 @@ self.onmessage = async (e) => {
         }
 
         checkFatal();
-        if (encoder) { updateUI('Finalizing Video...', 95); await withTimeout(encoder.flush(), 15000, 'Video Flush'); }
-        if (audioEncoder) { updateUI('Finalizing Audio...', 97); await withTimeout(audioEncoder.flush(), 10000, 'Audio Flush'); }
+        if (encoder) { updateUI('Finalizing Video...', 95); await withTimeout(encoder.flush(), 15000, 'Video Flush'); await videoSource.close(); }
+        if (audioEncoder) { updateUI('Finalizing Audio...', 97); await withTimeout(audioEncoder.flush(), 10000, 'Audio Flush'); await audioSource!.close(); }
         updateUI('Writing File...', 99); await withTimeout(output.finalize(), 60000, 'Muxer Finalize');
         const buffer = (target instanceof BufferTarget) ? target.buffer : null;
         self.postMessage({ type: 'COMPLETE', payload: buffer }, buffer ? [buffer] as any : []);
