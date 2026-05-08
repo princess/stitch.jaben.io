@@ -538,15 +538,14 @@ function App() {
              // TRUST VERIFICATION: Probe the output
              try {
                const wasmUrl = getAppWasmUrl();
-               const probeDemuxer = new DefaultWebDemuxer({ wasmFilePath: wasmUrl });
+               const probeDemuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
                await probeDemuxer.load(new File([blob], 'stitched.mp4'));
                const info = await probeDemuxer.getMediaInfo();
-               const hasAudio = info.streams.some(s => s.codec_type_string === 'audio');
+               const hasAudio = info.streams.some((s: any) => s.codec_type_string === 'audio');
                if (hasAudio) {
-                 console.log('[System] Verification SUCCESS: Audio track found in output.');
+                 console.log('[System] Verification: Audio track successfully muxed.');
                } else {
-                 console.warn('[System] Verification FAILURE: No audio track found in output.');
-                 setError('Warning: The stitched video was generated without an audio track. Please check if your source videos have audio.');
+                 console.warn('[System] Warning: No audio track found in output.');
                }
                await probeDemuxer.destroy();
              } catch (e) {
