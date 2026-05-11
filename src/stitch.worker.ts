@@ -7,7 +7,10 @@ import {
   EncodedVideoPacketSource, 
   AudioSampleSource, 
   AudioSample,
-  EncodedPacket 
+  EncodedPacket,
+  Input,
+  ALL_FORMATS,
+  BufferSource as MuxerBufferSource
 } from 'mediabunny';
 import type { StreamTargetChunk } from 'mediabunny';
 import { WebDemuxer } from 'web-demuxer';
@@ -176,7 +179,7 @@ self.onmessage = async (e) => {
               targetWidth = Math.floor(vConfig.codedWidth! / 2) * 2;
               targetHeight = Math.floor(vConfig.codedHeight! / 2) * 2;
               targetCodec = vConfig.codec.startsWith('hev') ? 'hevc' : 'avc';
-              try { originalMetadata = { date: new Date(), title: `Stitched on Pixel 6`, raw: { 'com.apple.quicktime.description': 'Processed by Stitch Engine' } }; } catch {}
+              try { originalMetadata = { date: new Date(), title: `Stitched by Stitch Engine`, raw: { 'com.apple.quicktime.description': 'Processed by Stitch Engine' } }; } catch {}
             } else {
               const vMatch = vConfig.codec === firstVideoConfig!.codec && vConfig.codedWidth === firstVideoConfig!.codedWidth &&
                              vConfig.codedHeight === firstVideoConfig!.codedHeight && buffersEqual(vConfig.description as ArrayBuffer, firstVideoConfig!.description as ArrayBuffer);
@@ -203,7 +206,7 @@ self.onmessage = async (e) => {
           } finally { await demuxer.destroy(); }
         }
 
-        if (canFastPath) addLog('[FastPath] Video optimized.');
+        if (canFastPath) addLog('[FastPath] Video bitstream copy active.');
         addLog(`[Clock] Adaptive Master Clock: ${maxFrameRate}fps.`);
 
         // 2. Muxer
@@ -219,14 +222,11 @@ self.onmessage = async (e) => {
         
         let audioSource: AudioSampleSource | null = null;
         if (hasAudioGlobal) { 
-          addLog('[Muxer] Initializing world-class audio track.');
+          addLog('[Muxer] Registering AAC-LC audio track.');
           audioSource = new AudioSampleSource({
             codec: 'aac',
             bitrate: 128_000,
-            transform: {
-              sampleRate: 44100,
-              numberOfChannels: 2
-            }
+            transform: { sampleRate: 44100, numberOfChannels: 2 }
           }); 
           output.addAudioTrack(audioSource); 
         }
@@ -306,11 +306,16 @@ self.onmessage = async (e) => {
             const processAudio = async () => {
               if (!audioSource) return;
               if (!currentAudioConfig) {
-                const silenceDuration = videoDuration || 0;
-                const frames = Math.floor((silenceDuration / 1000000) * 44100);
-                const silence = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: frames, numberOfChannels: 2, timestamp: accumulatedTimeMicros, data: new Float32Array(frames * 2) });
-                await audioSource!.add(new AudioSample(silence)); silence.close();
-                clipAudioMaxTime = silenceDuration;
+                addLog(`[Audio] Clip ${i}: Injecting 100ms silence chunks.`);
+                let remaining = videoDuration || 0;
+                while (remaining > 0) {
+                    const chunk = Math.min(100000, remaining);
+                    const frames = Math.floor((chunk / 1000000) * 44100);
+                    const silence = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: frames, numberOfChannels: 2, timestamp: accumulatedTimeMicros + (videoDuration || 0) - remaining, data: new Float32Array(frames * 2) });
+                    await audioSource!.add(new AudioSample(silence)); silence.close();
+                    remaining -= chunk;
+                }
+                clipAudioMaxTime = videoDuration || 0;
                 return;
               }
 
@@ -351,7 +356,7 @@ self.onmessage = async (e) => {
                     checkFatal(); const { done, value } = await reader.read(); if (done) break; audioDecoder.decode(value);
                   }
                   await audioDecoder.flush(); audioDecoder.close();
-                  addLog(`[Audio] DSP: Processed ${audioCount} buffers for clip ${i}.`);
+                  addLog(`[Audio] Clip ${i}: Processed ${audioCount} buffers.`);
               } catch (err) {
                 addLog(`[Audio] Warning: Clip ${i} failed: ${err instanceof Error ? err.message : String(err)}`);
               } finally { reader.releaseLock(); }
@@ -367,10 +372,32 @@ self.onmessage = async (e) => {
         checkFatal();
         if (encoder) { updateUI('Finalizing Video...', 95); await withTimeout(encoder.flush(), 15000, 'Video Flush'); }
         videoSource.close();
-        if (audioSource) audioSource.close();
+        if (audioSource) {
+            updateUI('Finalizing Audio...', 97);
+            audioSource.close();
+        }
 
         updateUI('Writing File...', 99); await withTimeout(output.finalize(), 60000, 'Muxer Finalize');
         const buffer = (target instanceof BufferTarget) ? target.buffer : null;
+        
+        // 5. Worker-Side Verification
+        if (buffer && hasAudioGlobal) {
+           try {
+             const verifyInput = new Input({ formats: ALL_FORMATS, source: new MuxerBufferSource(buffer) });
+             const audioTrack = await verifyInput.getPrimaryAudioTrack();
+             if (!audioTrack) {
+               addLog('[Hardware] CRITICAL: Worker-side verification failed. Audio track is missing from bitstream.');
+               throw new Error('Bitstream Validation Failed: No audio track found in generated MP4.');
+             }
+             const audioDur = await audioTrack.computeDuration();
+             addLog(`[Hardware] Verification: Audio track verified (${audioDur.toFixed(2)}s).`);
+             verifyInput.dispose();
+           } catch (vErr) {
+             addLog(`[Hardware] Verification Error: ${vErr instanceof Error ? vErr.message : String(vErr)}`);
+             if (vErr instanceof Error && vErr.message.includes('Validation Failed')) throw vErr;
+           }
+        }
+
         self.postMessage({ type: 'COMPLETE', payload: buffer }, buffer ? [buffer] as any : []);
       });
     } catch (err) {
