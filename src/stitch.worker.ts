@@ -324,51 +324,92 @@ self.onmessage = async (e) => {
                   let offset: number | null = null;
                   let audioCount = 0;
                   const FADE_MICROS = 30000;
+                  
+                  const configToSupport = {
+                    ...currentAudioConfig,
+                    description: currentAudioConfig.description ? new Uint8Array(currentAudioConfig.description as any) : undefined
+                  };
+                  
+                  const support = await AudioDecoder.isConfigSupported(configToSupport as any);
+                  if (!support.supported) {
+                    addLog(`[Audio] Warning: Codec ${currentAudioConfig.codec} may not be supported on this device. Trying anyway...`);
+                  }
+
                   const audioDecoder = new AudioDecoder({
                     output: (data) => {
-                      if (offset === null) offset = data.timestamp;
+                      try {
+                        if (offset === null) offset = data.timestamp;
 
-                      let relTs = Math.max(0, data.timestamp - offset);
-                      let ts = relTs + accumulatedTimeMicros;
-                      
-                      if (ts <= lastAudioTs) ts = lastAudioTs + 1;
-                      lastAudioTs = ts;
-
-                      const ratio = data.sampleRate / 44100, newFrames = Math.floor(data.numberOfFrames / ratio), interleaved = audioBufferPool.getOutput(newFrames * 2);
-                      for (let j = 0; j < data.numberOfChannels; j++) data.copyTo(audioBufferPool.getPlane(j, data.numberOfFrames), { planeIndex: j });
-                      
-                      for (let j = 0; j < newFrames; j++) {
-                        const srcIdx = j * ratio, idx1 = Math.floor(srcIdx), idx2 = Math.min(idx1 + 1, data.numberOfFrames - 1), weight = srcIdx - idx1;
-                        let fadeGain = 1.0;
-                        if (relTs < FADE_MICROS) {
-                            fadeGain = Math.max(0, relTs / FADE_MICROS);
-                        } else if (videoDuration && (videoDuration - (relTs + (data.duration || 0))) < FADE_MICROS) {
-                            fadeGain = Math.max(0, (videoDuration - (relTs + (data.duration || 0))) / FADE_MICROS);
+                        let relTs = Math.max(0, data.timestamp - offset);
+                        let ts = relTs + accumulatedTimeMicros;
+                        
+                        if (isNaN(ts)) {
+                          addLog(`[Audio] CRITICAL: NaN timestamp detected! relTs=${relTs}, acc=${accumulatedTimeMicros}`);
+                          ts = accumulatedTimeMicros || 0;
                         }
 
-                        for (let ch = 0; ch < 2; ch++) {
-                          const p = audioBufferPool.getPlane(ch % data.numberOfChannels, data.numberOfFrames);
-                          interleaved[j * 2 + ch] = (p[idx1] * (1 - weight) + p[idx2] * weight) * clipGain * fadeGain;
+                        if (ts <= lastAudioTs) ts = lastAudioTs + 1;
+                        lastAudioTs = ts;
+
+                        const ratio = data.sampleRate / 44100;
+                        const newFrames = Math.floor(data.numberOfFrames / ratio);
+                        
+                        if (newFrames <= 0) { data.close(); return; }
+
+                        const interleaved = audioBufferPool.getOutput(newFrames * 2);
+                        // Standardize format: We assume Float32Planar which is most common for WebCodecs
+                        // If it's something else, we might need a converter, but let's log it first.
+                        if (data.format !== 'f32-planar' && audioCount === 0) {
+                          addLog(`[Audio] Note: Source format is ${data.format}. Expected f32-planar.`);
                         }
-                      }
-                      
-                      if (newFrames > 0) {
-                        const finalData = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: newFrames, numberOfChannels: 2, timestamp: ts, data: interleaved.slice() });
+
+                        for (let j = 0; j < Math.min(data.numberOfChannels, 2); j++) {
+                          data.copyTo(audioBufferPool.getPlane(j, data.numberOfFrames), { planeIndex: j });
+                        }
+                        
+                        for (let j = 0; j < newFrames; j++) {
+                          const srcIdx = j * ratio, idx1 = Math.floor(srcIdx), idx2 = Math.min(idx1 + 1, data.numberOfFrames - 1), weight = srcIdx - idx1;
+                          let fadeGain = 1.0;
+                          const dur = data.duration || (data.numberOfFrames / data.sampleRate * 1000000);
+                          
+                          if (relTs < FADE_MICROS) {
+                              fadeGain = Math.max(0, relTs / FADE_MICROS);
+                          } else if (videoDuration && (videoDuration - (relTs + dur)) < FADE_MICROS) {
+                              fadeGain = Math.max(0, (videoDuration - (relTs + dur)) / FADE_MICROS);
+                          }
+
+                          for (let ch = 0; ch < 2; ch++) {
+                            const p = audioBufferPool.getPlane(ch % data.numberOfChannels, data.numberOfFrames);
+                            interleaved[j * 2 + ch] = (p[idx1] * (1 - weight) + p[idx2] * weight) * clipGain * fadeGain;
+                          }
+                        }
+                        
+                        const finalData = new AudioData({ 
+                          format: 'f32', 
+                          sampleRate: 44100, 
+                          numberOfFrames: newFrames, 
+                          numberOfChannels: 2, 
+                          timestamp: ts, 
+                          data: interleaved.slice() 
+                        });
                         audioSource!.add(new AudioSample(finalData)).catch(e => addLog(`[Audio] Mux Error: ${e.message}`));
                         finalData.close();
+                        
+                        audioCount++;
+                        const packetDur = data.duration || (data.numberOfFrames / data.sampleRate * 1000000);
+                        clipAudioMaxTime = Math.max(clipAudioMaxTime, relTs + packetDur); 
+                        data.close();
+                      } catch (outErr) {
+                        addLog(`[Audio] Internal Output Error: ${outErr instanceof Error ? outErr.message : String(outErr)}`);
+                        data.close();
                       }
-                      audioCount++;
-                      clipAudioMaxTime = Math.max(clipAudioMaxTime, relTs + (data.duration || 0)); data.close();
                     },
-                    error: (e) => addLog(`[Audio] Decoder Error: ${e.message}`)
+                    error: (e) => addLog(`[Audio] Decoder Callback Error: ${e.message}`)
                   });
 
                   addLog(`[Audio] Clip ${i}: Decoder configured with ${currentAudioConfig.codec}.`);
 
-                  audioDecoder.configure({
-                    ...currentAudioConfig,
-                    description: currentAudioConfig.description ? new Uint8Array(currentAudioConfig.description as any) : undefined
-                  });
+                  audioDecoder.configure(configToSupport as any);
 
                   while (true) {
                     checkFatal();
