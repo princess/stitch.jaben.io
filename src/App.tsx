@@ -489,10 +489,26 @@ function App() {
     setProgress(0);
     await requestWakeLock();
 
+    const hardReset = async () => {
+      try {
+        if ('serviceWorker' in navigator) {
+          const registrations = await navigator.serviceWorker.getRegistrations();
+          for (const reg of registrations) await reg.unregister();
+        }
+        if ('caches' in window) {
+          const keys = await caches.keys();
+          for (const key of keys) await caches.delete(key);
+        }
+        window.location.reload();
+      } catch (e) {
+        window.location.href = window.location.origin + '?reset=' + Date.now();
+      }
+    };
+
     const startPass = async (isSafe: boolean) => {
       currentPassId.current++;
       const passId = currentPassId.current;
-      
+
       if (workerRef.current) {
         workerRef.current.postMessage({ type: 'ABORT' });
         workerRef.current.terminate();
@@ -506,11 +522,18 @@ function App() {
       worker.onerror = (err) => {
         if (passId !== currentPassId.current) return;
         console.error('[Worker] Fatal Thread Crash:', err);
-        setError('The processing thread crashed. Retrying in Compatibility Mode...');
-        worker.terminate();
-        startPass(true);
-      };
 
+        if (isSafe) {
+          // ATOMIC SELF-HEALING: If we crash even in safe mode, something is 
+          // fundamentally wrong with the cached assets or memory state.
+          setError('System integrity check failed. Automatically repairing and reloading...');
+          setTimeout(hardReset, 2000);
+        } else {
+          setError('The processing thread crashed. Retrying in Compatibility Mode...');
+          worker.terminate();
+          startPass(true);
+        }
+      };
       worker.onmessage = async (e) => {
         const { type, payload } = e.data;
 

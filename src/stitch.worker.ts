@@ -339,11 +339,11 @@ self.onmessage = async (e) => {
                   let audioCount = 0;
                   const FADE_MICROS = 30000;
                   
-                  const configToSupport: AudioDecoderConfig = {
+                  const configToSupport: any = {
                     codec: currentAudioConfig.codec,
                     sampleRate: currentAudioConfig.sampleRate || 44100,
                     numberOfChannels: currentAudioConfig.numberOfChannels || 2,
-                    description: currentAudioConfig.description ? new Uint8Array(Array.from(new Uint8Array(currentAudioConfig.description as any))) : undefined
+                    description: currentAudioConfig.description ? new Uint8Array(currentAudioConfig.description as any).slice() : undefined
                   };
                   
                   addLog(`[Audio] Clip ${i}: Checking support for ${configToSupport.codec}...`);
