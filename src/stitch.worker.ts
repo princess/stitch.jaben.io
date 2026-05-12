@@ -480,7 +480,11 @@ self.onmessage = async (e) => {
               } finally { reader.releaseLock(); }
             };
 
-            await Promise.all([processVideo(), processAudio()]); checkFatal();
+            addLog(`[Clock] Clip ${i}: Starting sequential processing (Video then Audio).`);
+            await processVideo(); 
+            checkFatal();
+            await processAudio(); 
+            checkFatal();
             const clipDuration = Math.max(clipVideoMaxTime, clipAudioMaxTime, (videoDuration || 0));
             accumulatedTimeMicros += clipDuration;
             if (isMobile) { updateUI(`Cooling down...`, Math.round(((i + 1) / videos.length) * 90)); await new Promise(r => setTimeout(r, 600)); }
