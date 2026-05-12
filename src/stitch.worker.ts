@@ -339,21 +339,21 @@ self.onmessage = async (e) => {
                   let audioCount = 0;
                   const FADE_MICROS = 30000;
                   
-                  const configToSupport = {
-                    ...currentAudioConfig,
-                    description: currentAudioConfig.description ? new Uint8Array(currentAudioConfig.description as any) : undefined
+                  const configToSupport: AudioDecoderConfig = {
+                    codec: currentAudioConfig.codec,
+                    sampleRate: currentAudioConfig.sampleRate || 44100,
+                    numberOfChannels: currentAudioConfig.numberOfChannels || 2,
+                    description: currentAudioConfig.description ? new Uint8Array(Array.from(new Uint8Array(currentAudioConfig.description as any))) : undefined
                   };
                   
-                  addLog(`[Audio] Clip ${i}: Checking support for ${currentAudioConfig.codec}...`);
+                  addLog(`[Audio] Clip ${i}: Checking support for ${configToSupport.codec}...`);
                   if (typeof AudioDecoder.isConfigSupported === 'function') {
                     try {
-                      const support = await AudioDecoder.isConfigSupported(configToSupport as any);
+                      const support = await AudioDecoder.isConfigSupported(configToSupport);
                       addLog(`[Audio] Clip ${i}: Support check result: ${support.supported ? 'Supported' : 'Unsupported'}`);
                     } catch (supErr) {
                       addLog(`[Audio] Clip ${i}: isConfigSupported threw: ${supErr instanceof Error ? supErr.message : String(supErr)}`);
                     }
-                  } else {
-                    addLog(`[Audio] Clip ${i}: AudioDecoder.isConfigSupported not available.`);
                   }
 
                   addLog(`[Audio] Clip ${i}: Creating AudioDecoder...`);
@@ -431,14 +431,20 @@ self.onmessage = async (e) => {
                     error: (e) => addLog(`[Audio] Clip ${i}: Decoder Callback Error: ${e.message}`)
                   });
 
-                  addLog(`[Audio] Clip ${i}: Config details: codec=${currentAudioConfig.codec}, sr=${currentAudioConfig.sampleRate}, ch=${currentAudioConfig.numberOfChannels}, descLen=${currentAudioConfig.description?.byteLength || 0}`);
+                  addLog(`[Audio] Clip ${i}: Config details: codec=${configToSupport.codec}, sr=${configToSupport.sampleRate}, ch=${configToSupport.numberOfChannels}, descLen=${configToSupport.description?.byteLength || 0}`);
                   
                   try {
-                    audioDecoder.configure(configToSupport as any);
+                    audioDecoder.configure(configToSupport);
                     addLog(`[Audio] Clip ${i}: AudioDecoder configured successfully.`);
                   } catch (cfgErr) {
-                    addLog(`[Audio] Clip ${i}: configure() failed: ${cfgErr instanceof Error ? cfgErr.message : String(cfgErr)}`);
-                    throw cfgErr;
+                    addLog(`[Audio] Clip ${i}: configure() failed: ${cfgErr instanceof Error ? cfgErr.message : String(cfgErr)}. Retrying without description...`);
+                    try {
+                      audioDecoder.configure({ ...configToSupport, description: undefined });
+                      addLog(`[Audio] Clip ${i}: AudioDecoder configured (no-desc) successfully.`);
+                    } catch (retryErr) {
+                      addLog(`[Audio] Clip ${i}: Critical - All configure attempts failed.`);
+                      throw retryErr;
+                    }
                   }
 
                   addLog(`[Audio] Clip ${i}: Starting decode loop...`);
