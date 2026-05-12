@@ -325,13 +325,8 @@ self.onmessage = async (e) => {
                   let audioCount = 0;
                   const FADE_MICROS = 30000;
                   const audioDecoder = new AudioDecoder({
-                    output: async (data) => {
-                      if (offset === null) {
-                        // ATOMIC FIX: For the first clip, we ALWAYS want to start at 0.
-                        // For subsequent clips, we anchor to the reported timestamp but 
-                        // ensure we don't drift from the accumulated video time.
-                        offset = data.timestamp;
-                      }
+                    output: (data) => {
+                      if (offset === null) offset = data.timestamp;
 
                       let relTs = Math.max(0, data.timestamp - offset);
                       let ts = relTs + accumulatedTimeMicros;
@@ -345,9 +340,6 @@ self.onmessage = async (e) => {
                       for (let j = 0; j < newFrames; j++) {
                         const srcIdx = j * ratio, idx1 = Math.floor(srcIdx), idx2 = Math.min(idx1 + 1, data.numberOfFrames - 1), weight = srcIdx - idx1;
                         let fadeGain = 1.0;
-                        
-                        // Fading: Only apply if we are actually at the very start/end of the clip
-                        // to prevent clicking, but don't over-mute if timestamps are slightly jittery.
                         if (relTs < FADE_MICROS) {
                             fadeGain = Math.max(0, relTs / FADE_MICROS);
                         } else if (videoDuration && (videoDuration - (relTs + (data.duration || 0))) < FADE_MICROS) {
@@ -359,16 +351,36 @@ self.onmessage = async (e) => {
                           interleaved[j * 2 + ch] = (p[idx1] * (1 - weight) + p[idx2] * weight) * clipGain * fadeGain;
                         }
                       }
-                      const finalData = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: newFrames, numberOfChannels: 2, timestamp: ts, data: interleaved.slice() });
-                      await audioSource!.add(new AudioSample(finalData)); finalData.close();
+                      
+                      if (newFrames > 0) {
+                        const finalData = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: newFrames, numberOfChannels: 2, timestamp: ts, data: interleaved.slice() });
+                        audioSource!.add(new AudioSample(finalData)).catch(e => addLog(`[Audio] Mux Error: ${e.message}`));
+                        finalData.close();
+                      }
                       audioCount++;
                       clipAudioMaxTime = Math.max(clipAudioMaxTime, relTs + (data.duration || 0)); data.close();
                     },
-                    error: (e) => self.postMessage({ type: 'ERROR', payload: `AudioDecoder: ${e.message}` })
+                    error: (e) => addLog(`[Audio] Decoder Error: ${e.message}`)
                   });
-                  audioDecoder.configure(currentAudioConfig);
+
+                  addLog(`[Audio] Clip ${i}: Decoder configured with ${currentAudioConfig.codec}.`);
+
+                  audioDecoder.configure({
+                    ...currentAudioConfig,
+                    description: currentAudioConfig.description ? new Uint8Array(currentAudioConfig.description as any) : undefined
+                  });
+
                   while (true) {
-                    checkFatal(); const { done, value } = await reader.read(); if (done) break; audioDecoder.decode(value);
+                    checkFatal();
+                    if (audioDecoder.decodeQueueSize > 50) { await new Promise(r => setTimeout(r, 5)); continue; }
+                    const { done, value } = await reader.read(); 
+                    if (done) break; 
+                    try {
+                      audioDecoder.decode(value);
+                    } catch (decodeErr) {
+                      addLog(`[Audio] Decode Call Failed: ${decodeErr instanceof Error ? decodeErr.message : String(decodeErr)}`);
+                      break;
+                    }
                   }
                   await audioDecoder.flush(); audioDecoder.close();
                   addLog(`[Audio] Clip ${i}: Processed ${audioCount} buffers.`);
