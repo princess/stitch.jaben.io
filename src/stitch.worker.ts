@@ -304,9 +304,9 @@ self.onmessage = async (e) => {
             };
 
             const processAudio = async () => {
-              if (!audioSource) return;
+              if (!audioSource) { addLog(`[Audio] Clip ${i}: No audio source registered.`); return; }
               if (!currentAudioConfig) {
-                addLog(`[Audio] Clip ${i}: Injecting 100ms silence chunks.`);
+                addLog(`[Audio] Clip ${i}: No audio config found, injecting silence.`);
                 let remaining = videoDuration || 0;
                 while (remaining > 0) {
                     const chunk = Math.min(100000, remaining);
@@ -319,7 +319,21 @@ self.onmessage = async (e) => {
                 return;
               }
 
-              const reader = demuxer.read('audio').getReader();
+              addLog(`[Audio] Clip ${i}: Acquiring audio stream...`);
+              let audioStream;
+              try {
+                audioStream = demuxer.read('audio');
+              } catch (e) {
+                addLog(`[Audio] Clip ${i}: Failed to acquire audio stream: ${e instanceof Error ? e.message : String(e)}`);
+                return;
+              }
+              
+              if (!audioStream) {
+                addLog(`[Audio] Clip ${i}: Demuxer returned null audio stream.`);
+                return;
+              }
+
+              const reader = audioStream.getReader();
               try {
                   let offset: number | null = null;
                   let audioCount = 0;
@@ -330,37 +344,36 @@ self.onmessage = async (e) => {
                     description: currentAudioConfig.description ? new Uint8Array(currentAudioConfig.description as any) : undefined
                   };
                   
-                  const support = await AudioDecoder.isConfigSupported(configToSupport as any);
-                  if (!support.supported) {
-                    addLog(`[Audio] Warning: Codec ${currentAudioConfig.codec} may not be supported on this device. Trying anyway...`);
+                  addLog(`[Audio] Clip ${i}: Checking support for ${currentAudioConfig.codec}...`);
+                  if (typeof AudioDecoder.isConfigSupported === 'function') {
+                    try {
+                      const support = await AudioDecoder.isConfigSupported(configToSupport as any);
+                      addLog(`[Audio] Clip ${i}: Support check result: ${support.supported ? 'Supported' : 'Unsupported'}`);
+                    } catch (supErr) {
+                      addLog(`[Audio] Clip ${i}: isConfigSupported threw: ${supErr instanceof Error ? supErr.message : String(supErr)}`);
+                    }
+                  } else {
+                    addLog(`[Audio] Clip ${i}: AudioDecoder.isConfigSupported not available.`);
                   }
 
+                  addLog(`[Audio] Clip ${i}: Creating AudioDecoder...`);
                   const audioDecoder = new AudioDecoder({
                     output: (data) => {
                       try {
                         if (offset === null) offset = data.timestamp;
-
                         let relTs = Math.max(0, data.timestamp - offset);
                         let ts = relTs + accumulatedTimeMicros;
-                        
-                        if (isNaN(ts)) {
-                          addLog(`[Audio] CRITICAL: NaN timestamp detected! relTs=${relTs}, acc=${accumulatedTimeMicros}`);
-                          ts = accumulatedTimeMicros || 0;
-                        }
-
+                        if (isNaN(ts)) ts = accumulatedTimeMicros || 0;
                         if (ts <= lastAudioTs) ts = lastAudioTs + 1;
                         lastAudioTs = ts;
 
                         const ratio = data.sampleRate / 44100;
                         const newFrames = Math.floor(data.numberOfFrames / ratio);
-                        
                         if (newFrames <= 0) { data.close(); return; }
 
                         const interleaved = audioBufferPool.getOutput(newFrames * 2);
-                        // Standardize format: We assume Float32Planar which is most common for WebCodecs
-                        // If it's something else, we might need a converter, but let's log it first.
                         if (data.format !== 'f32-planar' && audioCount === 0) {
-                          addLog(`[Audio] Note: Source format is ${data.format}. Expected f32-planar.`);
+                          addLog(`[Audio] Clip ${i}: Source format is ${data.format}. Expected f32-planar.`);
                         }
 
                         for (let j = 0; j < Math.min(data.numberOfChannels, 2); j++) {
@@ -371,7 +384,6 @@ self.onmessage = async (e) => {
                           const srcIdx = j * ratio, idx1 = Math.floor(srcIdx), idx2 = Math.min(idx1 + 1, data.numberOfFrames - 1), weight = srcIdx - idx1;
                           let fadeGain = 1.0;
                           const dur = data.duration || (data.numberOfFrames / data.sampleRate * 1000000);
-                          
                           if (relTs < FADE_MICROS) {
                               fadeGain = Math.max(0, relTs / FADE_MICROS);
                           } else if (videoDuration && (videoDuration - (relTs + dur)) < FADE_MICROS) {
@@ -385,14 +397,10 @@ self.onmessage = async (e) => {
                         }
                         
                         const finalData = new AudioData({ 
-                          format: 'f32', 
-                          sampleRate: 44100, 
-                          numberOfFrames: newFrames, 
-                          numberOfChannels: 2, 
-                          timestamp: ts, 
-                          data: interleaved.slice() 
+                          format: 'f32', sampleRate: 44100, numberOfFrames: newFrames, numberOfChannels: 2, 
+                          timestamp: ts, data: interleaved.slice() 
                         });
-                        audioSource!.add(new AudioSample(finalData)).catch(e => addLog(`[Audio] Mux Error: ${e.message}`));
+                        audioSource!.add(new AudioSample(finalData)).catch(e => addLog(`[Audio] Clip ${i}: Mux Error: ${e.message}`));
                         finalData.close();
                         
                         audioCount++;
@@ -400,30 +408,49 @@ self.onmessage = async (e) => {
                         clipAudioMaxTime = Math.max(clipAudioMaxTime, relTs + packetDur); 
                         data.close();
                       } catch (outErr) {
-                        addLog(`[Audio] Internal Output Error: ${outErr instanceof Error ? outErr.message : String(outErr)}`);
+                        addLog(`[Audio] Clip ${i}: Internal Output Error: ${outErr instanceof Error ? outErr.message : String(outErr)}`);
                         data.close();
                       }
                     },
-                    error: (e) => addLog(`[Audio] Decoder Callback Error: ${e.message}`)
+                    error: (e) => addLog(`[Audio] Clip ${i}: Decoder Callback Error: ${e.message}`)
                   });
 
-                  addLog(`[Audio] Clip ${i}: Decoder configured with ${currentAudioConfig.codec}.`);
+                  addLog(`[Audio] Clip ${i}: Configuring AudioDecoder...`);
+                  try {
+                    audioDecoder.configure(configToSupport as any);
+                    addLog(`[Audio] Clip ${i}: AudioDecoder configured successfully.`);
+                  } catch (cfgErr) {
+                    addLog(`[Audio] Clip ${i}: configure() failed: ${cfgErr instanceof Error ? cfgErr.message : String(cfgErr)}`);
+                    throw cfgErr;
+                  }
 
-                  audioDecoder.configure(configToSupport as any);
-
+                  addLog(`[Audio] Clip ${i}: Starting decode loop...`);
                   while (true) {
                     checkFatal();
                     if (audioDecoder.decodeQueueSize > 50) { await new Promise(r => setTimeout(r, 5)); continue; }
-                    const { done, value } = await reader.read(); 
-                    if (done) break; 
+                    
+                    let readResult;
+                    try {
+                      readResult = await reader.read();
+                    } catch (readErr) {
+                      addLog(`[Audio] Clip ${i}: reader.read() failed: ${readErr instanceof Error ? readErr.message : String(readErr)}`);
+                      throw readErr;
+                    }
+
+                    const { done, value } = readResult;
+                    if (done) { addLog(`[Audio] Clip ${i}: Stream EOF reached.`); break; }
+                    
                     try {
                       audioDecoder.decode(value);
                     } catch (decodeErr) {
-                      addLog(`[Audio] Decode Call Failed: ${decodeErr instanceof Error ? decodeErr.message : String(decodeErr)}`);
+                      addLog(`[Audio] Clip ${i}: decode() failed: ${decodeErr instanceof Error ? decodeErr.message : String(decodeErr)}`);
                       break;
                     }
                   }
-                  await audioDecoder.flush(); audioDecoder.close();
+
+                  addLog(`[Audio] Clip ${i}: Flushing decoder...`);
+                  await audioDecoder.flush(); 
+                  audioDecoder.close();
                   addLog(`[Audio] Clip ${i}: Processed ${audioCount} buffers.`);
               } catch (err) {
                 addLog(`[Audio] Warning: Clip ${i} failed: ${err instanceof Error ? err.message : String(err)}`);
