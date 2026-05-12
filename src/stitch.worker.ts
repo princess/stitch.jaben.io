@@ -326,19 +326,34 @@ self.onmessage = async (e) => {
                   const FADE_MICROS = 30000;
                   const audioDecoder = new AudioDecoder({
                     output: async (data) => {
-                      if (offset === null) offset = data.timestamp;
-                      let ts = Math.max(0, (data.timestamp - offset)) + accumulatedTimeMicros;
+                      if (offset === null) {
+                        // ATOMIC FIX: For the first clip, we ALWAYS want to start at 0.
+                        // For subsequent clips, we anchor to the reported timestamp but 
+                        // ensure we don't drift from the accumulated video time.
+                        offset = data.timestamp;
+                      }
+
+                      let relTs = Math.max(0, data.timestamp - offset);
+                      let ts = relTs + accumulatedTimeMicros;
+                      
                       if (ts <= lastAudioTs) ts = lastAudioTs + 1;
                       lastAudioTs = ts;
 
                       const ratio = data.sampleRate / 44100, newFrames = Math.floor(data.numberOfFrames / ratio), interleaved = audioBufferPool.getOutput(newFrames * 2);
                       for (let j = 0; j < data.numberOfChannels; j++) data.copyTo(audioBufferPool.getPlane(j, data.numberOfFrames), { planeIndex: j });
+                      
                       for (let j = 0; j < newFrames; j++) {
                         const srcIdx = j * ratio, idx1 = Math.floor(srcIdx), idx2 = Math.min(idx1 + 1, data.numberOfFrames - 1), weight = srcIdx - idx1;
                         let fadeGain = 1.0;
-                        const relTs = ts - accumulatedTimeMicros;
-                        if (relTs < FADE_MICROS) fadeGain = relTs / FADE_MICROS;
-                        else if (videoDuration && (videoDuration - relTs) < FADE_MICROS) fadeGain = (videoDuration - relTs) / FADE_MICROS;
+                        
+                        // Fading: Only apply if we are actually at the very start/end of the clip
+                        // to prevent clicking, but don't over-mute if timestamps are slightly jittery.
+                        if (relTs < FADE_MICROS) {
+                            fadeGain = Math.max(0, relTs / FADE_MICROS);
+                        } else if (videoDuration && (videoDuration - (relTs + (data.duration || 0))) < FADE_MICROS) {
+                            fadeGain = Math.max(0, (videoDuration - (relTs + (data.duration || 0))) / FADE_MICROS);
+                        }
+
                         for (let ch = 0; ch < 2; ch++) {
                           const p = audioBufferPool.getPlane(ch % data.numberOfChannels, data.numberOfFrames);
                           interleaved[j * 2 + ch] = (p[idx1] * (1 - weight) + p[idx2] * weight) * clipGain * fadeGain;
@@ -347,7 +362,7 @@ self.onmessage = async (e) => {
                       const finalData = new AudioData({ format: 'f32', sampleRate: 44100, numberOfFrames: newFrames, numberOfChannels: 2, timestamp: ts, data: interleaved.slice() });
                       await audioSource!.add(new AudioSample(finalData)); finalData.close();
                       audioCount++;
-                      clipAudioMaxTime = Math.max(clipAudioMaxTime, (ts - accumulatedTimeMicros) + (data.duration || 0)); data.close();
+                      clipAudioMaxTime = Math.max(clipAudioMaxTime, relTs + (data.duration || 0)); data.close();
                     },
                     error: (e) => self.postMessage({ type: 'ERROR', payload: `AudioDecoder: ${e.message}` })
                   });
