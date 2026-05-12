@@ -396,10 +396,26 @@ self.onmessage = async (e) => {
                           }
                         }
                         
-                        const finalData = new AudioData({ 
-                          format: 'f32', sampleRate: 44100, numberOfFrames: newFrames, numberOfChannels: 2, 
-                          timestamp: ts, data: interleaved.slice() 
-                        });
+                        const finalFormat = 'f32';
+                        const finalSampleRate = 44100;
+                        const finalChannels = 2;
+                        
+                        let finalData: AudioData;
+                        try {
+                          finalData = new AudioData({ 
+                            format: finalFormat, 
+                            sampleRate: finalSampleRate, 
+                            numberOfFrames: newFrames, 
+                            numberOfChannels: finalChannels, 
+                            timestamp: ts, 
+                            data: interleaved.slice() 
+                          });
+                        } catch (constructErr) {
+                          addLog(`[Audio] Clip ${i}: AudioData construction failed: ${constructErr instanceof Error ? constructErr.message : String(constructErr)}. frames=${newFrames}, ts=${ts}`);
+                          data.close();
+                          return;
+                        }
+
                         audioSource!.add(new AudioSample(finalData)).catch(e => addLog(`[Audio] Clip ${i}: Mux Error: ${e.message}`));
                         finalData.close();
                         
@@ -415,7 +431,8 @@ self.onmessage = async (e) => {
                     error: (e) => addLog(`[Audio] Clip ${i}: Decoder Callback Error: ${e.message}`)
                   });
 
-                  addLog(`[Audio] Clip ${i}: Configuring AudioDecoder...`);
+                  addLog(`[Audio] Clip ${i}: Config details: codec=${currentAudioConfig.codec}, sr=${currentAudioConfig.sampleRate}, ch=${currentAudioConfig.numberOfChannels}, descLen=${currentAudioConfig.description?.byteLength || 0}`);
+                  
                   try {
                     audioDecoder.configure(configToSupport as any);
                     addLog(`[Audio] Clip ${i}: AudioDecoder configured successfully.`);
