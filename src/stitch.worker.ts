@@ -6,19 +6,36 @@ import {
   StreamTarget,
   EncodedVideoPacketSource, 
   AudioSampleSource, 
-  AudioSample,
-  EncodedPacket,
-  Input,
-  ALL_FORMATS,
-  BufferSource as MuxerBufferSource
+	AudioSample,
+	EncodedPacket,
+	Input,
+	ALL_FORMATS,
+	BufferSource as MuxerBufferSource
 } from 'mediabunny';
-import type { StreamTargetChunk } from 'mediabunny';
+import type { MetadataTags, StreamTargetChunk } from 'mediabunny';
 import { WebDemuxer } from 'web-demuxer';
 import { WASM_BASE64 } from './wasm_data';
 
 // Worker state
 let currentAbortController: AbortController | null = null;
 let cachedWasmUrl: string | null = null;
+
+type StitchClip = {
+  id: string;
+  file: File;
+};
+
+type StartPayload = {
+  videos: StitchClip[];
+  isSafeMode: boolean;
+  isMobile: boolean;
+  passId: number;
+  useDiskStream: boolean;
+};
+
+type WorkerInputMessage =
+  | { type: 'ABORT' }
+  | { type: 'START'; payload: StartPayload };
 
 function buffersEqual(a: ArrayBuffer | undefined, b: ArrayBuffer | undefined) {
   if (a === b) return true;
@@ -28,6 +45,19 @@ function buffersEqual(a: ArrayBuffer | undefined, b: ArrayBuffer | undefined) {
   const viewB = new Uint8Array(b);
   for (let i = 0; i < viewA.length; i++) if (viewA[i] !== viewB[i]) return false;
   return true;
+}
+
+function cloneBufferSource(source: AllowSharedBufferSource | undefined) {
+  if (!source) return undefined;
+  if (source instanceof ArrayBuffer) {
+    return new Uint8Array(source).slice();
+  }
+  if (typeof SharedArrayBuffer !== 'undefined' && source instanceof SharedArrayBuffer) {
+    return new Uint8Array(source).slice();
+  }
+  if (!ArrayBuffer.isView(source)) return undefined;
+
+  return new Uint8Array(source.buffer, source.byteOffset, source.byteLength).slice();
 }
 
 async function getWasmUrl(): Promise<string> {
@@ -132,12 +162,12 @@ const withTimeout = <T,>(p: Promise<T>, ms: number, label: string): Promise<T> =
   ]);
 };
 
-self.onmessage = async (e) => {
-  const { type, payload } = e.data;
+self.onmessage = async (e: MessageEvent<WorkerInputMessage>) => {
+  const { type } = e.data;
   if (type === 'ABORT') { if (currentAbortController) currentAbortController.abort(); return; }
 
   if (type === 'START') {
-    const { videos, isSafeMode, isMobile, passId, useDiskStream } = payload;
+    const { videos, isSafeMode, isMobile, passId, useDiskStream } = e.data.payload;
     currentAbortController = new AbortController();
     const wasmUrl = await getWasmUrl();
     const signal = currentAbortController.signal;
@@ -155,7 +185,7 @@ self.onmessage = async (e) => {
         let targetWidth = 0, targetHeight = 0, targetCodec = 'avc', hasAudioGlobal = false;
         let firstVideoConfig: VideoDecoderConfig | null = null;
         let canFastPath = true, maxFrameRate = 30;
-        let originalMetadata: any = null;
+        let originalMetadata: MetadataTags | null = null;
         const videoMetadata: { duration: number, peak: number }[] = [];
 
         updateUI('Analyzing media grid...', 0);
@@ -179,7 +209,11 @@ self.onmessage = async (e) => {
               targetWidth = Math.floor(vConfig.codedWidth! / 2) * 2;
               targetHeight = Math.floor(vConfig.codedHeight! / 2) * 2;
               targetCodec = vConfig.codec.startsWith('hev') ? 'hevc' : 'avc';
-              try { originalMetadata = { date: new Date(), title: `Stitched by Stitch Engine`, raw: { 'com.apple.quicktime.description': 'Processed by Stitch Engine' } }; } catch {}
+              originalMetadata = {
+                date: new Date(),
+                title: 'Stitched by Stitch Engine',
+                raw: { 'com.apple.quicktime.description': 'Processed by Stitch Engine' },
+              };
             } else {
               const vMatch = vConfig.codec === firstVideoConfig!.codec && vConfig.codedWidth === firstVideoConfig!.codedWidth &&
                              vConfig.codedHeight === firstVideoConfig!.codedHeight && buffersEqual(vConfig.description as ArrayBuffer, firstVideoConfig!.description as ArrayBuffer);
@@ -191,7 +225,7 @@ self.onmessage = async (e) => {
               const audioDecoder = new AudioDecoder({
                 output: (data) => {
                   const p0 = new Float32Array(data.numberOfFrames); data.copyTo(p0, { planeIndex: 0 });
-                  for (let val of p0) clipPeak = Math.max(clipPeak, Math.abs(val));
+                  for (const val of p0) clipPeak = Math.max(clipPeak, Math.abs(val));
                   data.close();
                 },
                 error: () => {}
@@ -212,7 +246,9 @@ self.onmessage = async (e) => {
         // 2. Muxer
         let target: BufferTarget | StreamTarget;
         if (useDiskStream) {
-          const ws = new WritableStream<StreamTargetChunk>({ write: (c) => self.postMessage({ type: 'DISK_WRITE', payload: c }, [c.data.buffer] as any) });
+          const ws = new WritableStream<StreamTargetChunk>({
+            write: (c) => self.postMessage({ type: 'DISK_WRITE', payload: c }, [c.data.buffer]),
+          });
           target = new StreamTarget(ws);
         } else { target = new BufferTarget(); }
 
@@ -240,17 +276,30 @@ self.onmessage = async (e) => {
           encoder = new VideoEncoder({
             output: async (chunk, meta) => {
               const packet = EncodedPacket.fromEncodedChunk(chunk);
-              await videoSource.add(packet, meta?.decoderConfig ? { decoderConfig: { ...meta.decoderConfig, description: meta.decoderConfig.description ? new Uint8Array(meta.decoderConfig.description as any) : undefined } } : undefined);
+              await videoSource.add(packet, meta?.decoderConfig ? {
+                decoderConfig: {
+                  ...meta.decoderConfig,
+                  description: cloneBufferSource(meta.decoderConfig.description),
+                },
+              } : undefined);
             },
             error: (e) => self.postMessage({ type: 'ERROR', payload: `VideoEncoder: ${e.message}` })
           });
-          encoder.configure({ codec: 'avc1.4D4034', width: targetWidth, height: targetHeight, bitrate: 5_000_000, framerate: maxFrameRate, hardwareAcceleration: 'prefer-hardware' });
+              encoder.configure({
+                codec: 'avc1.4D4034',
+                width: targetWidth,
+                height: targetHeight,
+                bitrate: 5_000_000,
+                framerate: maxFrameRate,
+                hardwareAcceleration: isSafeMode ? 'prefer-software' : 'prefer-hardware',
+              });
         }
 
         // 4. Loop
-        const canvas = new OffscreenCanvas(targetWidth, targetHeight);
-        const renderer = new WebGPURenderer(canvas);
-        await renderer.init();
+	        const canvas = new OffscreenCanvas(targetWidth, targetHeight);
+	        const renderer = new WebGPURenderer(canvas);
+	        if (!isSafeMode) await renderer.init();
+	        const canvas2d = renderer.isSupported ? null : canvas.getContext('2d');
         const frameInterval = 1000000 / maxFrameRate;
         const audioBufferPool = new BufferPool(44100);
         let accumulatedTimeMicros = 0, lastAudioTs = -1;
@@ -264,7 +313,7 @@ self.onmessage = async (e) => {
             const vConfig = await demuxer.getDecoderConfig('video');
             const mediaInfo = await demuxer.getMediaInfo();
             const videoDuration = mediaInfo.duration;
-            let currentAudioConfig: AudioDecoderConfig | null = await demuxer.getDecoderConfig('audio').catch(() => null);
+            const currentAudioConfig: AudioDecoderConfig | null = await demuxer.getDecoderConfig('audio').catch(() => null);
             let clipVideoMaxTime = 0, clipAudioMaxTime = 0, frameCount = 0;
             const clipGain = videoMetadata[i].peak > 0 ? Math.min(2.0, 0.9 / videoMetadata[i].peak) : 1.0;
 
@@ -275,7 +324,12 @@ self.onmessage = async (e) => {
                   while (true) {
                     checkFatal(); const { done, value: chunk } = await reader.read(); if (done) break;
                     const packet = EncodedPacket.fromEncodedChunk(chunk).clone({ timestamp: (accumulatedTimeMicros + (frameCount * frameInterval)) / 1000000 });
-                    await videoSource.add(packet, frameCount === 0 ? { decoderConfig: { ...vConfig, description: vConfig.description ? new Uint8Array(vConfig.description as any) : undefined } } : undefined);
+                    await videoSource.add(packet, frameCount === 0 ? {
+                      decoderConfig: {
+                        ...vConfig,
+                        description: cloneBufferSource(vConfig.description),
+                      },
+                    } : undefined);
                     frameCount++; clipVideoMaxTime = Math.max(clipVideoMaxTime, (frameCount * frameInterval));
                     if (frameCount % 60 === 0) updateUI(undefined, Math.round(((i + Math.min(1, frameCount / (videoDuration * (1000000 / frameInterval)))) / videos.length) * 90));
                   }
@@ -283,10 +337,28 @@ self.onmessage = async (e) => {
                   let offset: number | null = null;
                   const decoder = new VideoDecoder({
                     output: (frame) => {
-                      if (offset === null) offset = frame.timestamp;
-                      const ts = accumulatedTimeMicros + (frameCount * frameInterval);
-                      if (renderer.isSupported) renderer.render(frame, targetWidth, targetHeight);
-                      const fte = new VideoFrame(canvas, { timestamp: ts, duration: frameInterval });
+	                      if (offset === null) offset = frame.timestamp;
+	                      const ts = accumulatedTimeMicros + (frameCount * frameInterval);
+	                      if (renderer.isSupported) renderer.render(frame, targetWidth, targetHeight);
+	                      else if (canvas2d) {
+	                        canvas2d.fillStyle = '#000';
+	                        canvas2d.fillRect(0, 0, targetWidth, targetHeight);
+	                        const ar = frame.displayWidth / frame.displayHeight;
+	                        const tar = targetWidth / targetHeight;
+	                        let dw = targetWidth;
+	                        let dh = targetHeight;
+	                        let ox = 0;
+	                        let oy = 0;
+	                        if (ar > tar) {
+	                          dh = targetWidth / ar;
+	                          oy = (targetHeight - dh) / 2;
+	                        } else {
+	                          dw = targetHeight * ar;
+	                          ox = (targetWidth - dw) / 2;
+	                        }
+	                        canvas2d.drawImage(frame, ox, oy, dw, dh);
+	                      }
+	                      const fte = new VideoFrame(canvas, { timestamp: ts, duration: frameInterval });
                       if (encoder!.state === 'configured') { encoder!.encode(fte, { keyFrame: frameCount % 60 === 0 }); frameCount++; }
                       clipVideoMaxTime = Math.max(clipVideoMaxTime, (frameCount * frameInterval));
                       fte.close(); frame.close();
@@ -335,15 +407,16 @@ self.onmessage = async (e) => {
 
               const reader = audioStream.getReader();
               try {
-                  let offset: number | null = null;
-                  let audioCount = 0;
-                  const FADE_MICROS = 30000;
+	                  let offset: number | null = null;
+	                  let audioCount = 0;
+	                  const FADE_MICROS = 30000;
+	                  const pendingAudioAdds: Promise<void>[] = [];
                   
-                  const configToSupport: any = {
+                  const configToSupport: AudioDecoderConfig = {
                     codec: currentAudioConfig.codec,
                     sampleRate: currentAudioConfig.sampleRate || 44100,
                     numberOfChannels: currentAudioConfig.numberOfChannels || 2,
-                    description: currentAudioConfig.description ? new Uint8Array(currentAudioConfig.description as any).slice() : undefined
+                    description: cloneBufferSource(currentAudioConfig.description)
                   };
                   
                   addLog(`[Audio] Clip ${i}: Checking support for ${configToSupport.codec}...`);
@@ -361,7 +434,7 @@ self.onmessage = async (e) => {
                     output: (data) => {
                       try {
                         if (offset === null) offset = data.timestamp;
-                        let relTs = Math.max(0, data.timestamp - offset);
+                        const relTs = Math.max(0, data.timestamp - offset);
                         let ts = relTs + accumulatedTimeMicros;
                         if (isNaN(ts)) ts = accumulatedTimeMicros || 0;
                         if (ts <= lastAudioTs) ts = lastAudioTs + 1;
@@ -416,8 +489,11 @@ self.onmessage = async (e) => {
                           return;
                         }
 
-                        audioSource!.add(new AudioSample(finalData)).catch(e => addLog(`[Audio] Clip ${i}: Mux Error: ${e.message}`));
-                        finalData.close();
+	                        const sample = new AudioSample(finalData);
+	                        const addPromise = audioSource!.add(sample)
+	                          .catch(e => addLog(`[Audio] Clip ${i}: Mux Error: ${e instanceof Error ? e.message : String(e)}`))
+	                          .finally(() => finalData.close());
+	                        pendingAudioAdds.push(addPromise);
                         
                         audioCount++;
                         const packetDur = data.duration || (data.numberOfFrames / data.sampleRate * 1000000);
@@ -471,9 +547,10 @@ self.onmessage = async (e) => {
                     }
                   }
 
-                  addLog(`[Audio] Clip ${i}: Flushing decoder...`);
-                  await audioDecoder.flush(); 
-                  audioDecoder.close();
+	                  addLog(`[Audio] Clip ${i}: Flushing decoder...`);
+	                  await audioDecoder.flush(); 
+	                  await Promise.all(pendingAudioAdds);
+	                  audioDecoder.close();
                   addLog(`[Audio] Clip ${i}: Processed ${audioCount} buffers.`);
               } catch (err) {
                 addLog(`[Audio] Warning: Clip ${i} failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -520,7 +597,7 @@ self.onmessage = async (e) => {
            }
         }
 
-        self.postMessage({ type: 'COMPLETE', payload: buffer }, buffer ? [buffer] as any : []);
+        self.postMessage({ type: 'COMPLETE', payload: buffer }, buffer ? [buffer] : []);
       });
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') return;

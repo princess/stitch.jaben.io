@@ -1,13 +1,32 @@
 import { test, expect } from '@playwright/test';
 import path from 'path';
 
+type MockWorkerStartMessage = {
+  type: 'START';
+  payload: {
+    passId: number;
+    isSafeMode?: boolean;
+  };
+};
+
+type MockWorkerMessage = MockWorkerStartMessage | { type: string; payload?: unknown };
+type MockWorkerEvent = { data: unknown };
+type MockWorkerLike = {
+  onmessage: ((event: MockWorkerEvent) => void) | null;
+  onerror: ((event: ErrorEvent) => void) | null;
+  postMessage: (msg: MockWorkerMessage) => void;
+  terminate: () => void;
+  addEventListener: () => void;
+  removeEventListener: () => void;
+  dispatchEvent: () => boolean;
+};
+
 test.describe('Stitch Professional Engine', () => {
 
   test.beforeEach(async ({ page }) => {
     // ATOMIC VERIFICATION: Unified Mocking
     await page.addInitScript(() => {
-      // @ts-ignore
-      window.WebDemuxer = class {
+      (window as typeof window & { WebDemuxer: unknown }).WebDemuxer = class {
         constructor() {}
         async load() { return Promise.resolve(); }
         async getMediaInfo() { 
@@ -41,12 +60,11 @@ test.describe('Stitch Professional Engine', () => {
       };
 
       // Robust Worker Mock
-      // @ts-ignore
-      window.Worker = function(url) {
-        const workerObj = {
-          onmessage: null as any,
-          onerror: null as any,
-          postMessage: (msg: any) => {
+      (window as typeof window & { Worker: typeof Worker }).Worker = function MockWorker() {
+        const workerObj: MockWorkerLike = {
+          onmessage: null,
+          onerror: null,
+          postMessage: (msg: MockWorkerMessage) => {
             if (msg.type === 'START') {
               const passId = msg.payload.passId;
               setTimeout(() => {
@@ -67,8 +85,8 @@ test.describe('Stitch Professional Engine', () => {
           removeEventListener: () => {},
           dispatchEvent: () => true
         };
-        return workerObj;
-      };
+        return workerObj as unknown as Worker;
+      } as unknown as typeof Worker;
     });
 
     await page.goto('/', { waitUntil: 'networkidle' });
@@ -159,14 +177,12 @@ test.describe('Stitch Professional Engine', () => {
     await fc.setFiles([filePath, filePath]);
 
     await page.evaluate(() => {
-      // @ts-ignore
-      window.Worker = function() {
-        const workerObj = {
-          onmessage: null as any,
-          onerror: null as any,
-          postMessage: (msg: any) => {
+      (window as typeof window & { Worker: typeof Worker }).Worker = function MockWorker() {
+        const workerObj: MockWorkerLike = {
+          onmessage: null,
+          onerror: null,
+          postMessage: (msg: MockWorkerMessage) => {
             if (msg.type === 'START') {
-              const passId = msg.payload.passId;
               if (!msg.payload.isSafeMode) {
                 setTimeout(() => {
                   if (workerObj.onmessage) workerObj.onmessage({ 
@@ -185,8 +201,8 @@ test.describe('Stitch Professional Engine', () => {
           removeEventListener: () => {},
           dispatchEvent: () => true
         };
-        return workerObj;
-      };
+        return workerObj as unknown as Worker;
+      } as unknown as typeof Worker;
     });
 
     await page.click('button:has-text("Stitch 2 Videos")');
@@ -208,17 +224,15 @@ test.describe('Stitch Professional Engine', () => {
     await fc.setFiles([filePath, filePath]);
 
     await page.evaluate(() => {
-      // @ts-ignore
-      window.Worker = function() {
-        const workerObj = {
-          onmessage: null as any,
-          onerror: null as any,
-          postMessage: (msg: any) => {
+      (window as typeof window & { Worker: typeof Worker }).Worker = function MockWorker() {
+        const workerObj: MockWorkerLike = {
+          onmessage: null,
+          onerror: null,
+          postMessage: (msg: MockWorkerMessage) => {
             if (msg.type === 'START') {
-              const passId = msg.payload.passId;
               setTimeout(() => {
                 if (workerObj.onmessage) workerObj.onmessage({ 
-                  data: { type: 'UPDATE_UI', payload: { passId, newStatus: 'Cooling down...', newProgress: 90 } } 
+                  data: { type: 'UPDATE_UI', payload: { passId: msg.payload.passId, newStatus: 'Cooling down...', newProgress: 90 } } 
                 });
               }, 100);
             }
@@ -228,8 +242,8 @@ test.describe('Stitch Professional Engine', () => {
           removeEventListener: () => {},
           dispatchEvent: () => true
         };
-        return workerObj;
-      };
+        return workerObj as unknown as Worker;
+      } as unknown as typeof Worker;
     });
 
     await page.click('button:has-text("Stitch 2 Videos")');
@@ -245,12 +259,11 @@ test.describe('Stitch Professional Engine', () => {
     await fc.setFiles([filePath, filePath]);
 
     await page.evaluate(() => {
-      // @ts-ignore
-      window.Worker = function() {
-        const workerObj = {
-          onmessage: null as any,
-          onerror: null as any,
-          postMessage: (msg: any) => {
+      (window as typeof window & { Worker: typeof Worker }).Worker = function MockWorker() {
+        const workerObj: MockWorkerLike = {
+          onmessage: null,
+          onerror: null,
+          postMessage: (msg: MockWorkerMessage) => {
             if (msg.type === 'START') {
               setTimeout(() => {
                 if (workerObj.onmessage) workerObj.onmessage({ 
@@ -264,8 +277,8 @@ test.describe('Stitch Professional Engine', () => {
           removeEventListener: () => {},
           dispatchEvent: () => true
         };
-        return workerObj;
-      };
+        return workerObj as unknown as Worker;
+      } as unknown as typeof Worker;
     });
 
     await page.click('button:has-text("Stitch 2 Videos")');
@@ -290,9 +303,14 @@ test.describe('Stitch Professional Engine', () => {
   });
 
   test('should support disk streaming UI toggle', async ({ page }) => {
-    await page.evaluate(() => {
-      // @ts-ignore
-      window.showSaveFilePicker = async () => ({});
+    await page.addInitScript(() => {
+      (window as typeof window & { showSaveFilePicker: unknown }).showSaveFilePicker = async () => ({
+        createWritable: async () => ({
+          write: async () => undefined,
+          close: async () => undefined,
+          abort: async () => undefined,
+        }),
+      });
     });
     await page.goto('/', { waitUntil: 'networkidle' });
     const filePath = path.resolve('tests/fixtures/test.mp4');

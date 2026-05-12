@@ -3,7 +3,31 @@ import React, { useState, useRef, useEffect } from 'react';
 import { WebDemuxer as DefaultWebDemuxer } from 'web-demuxer';
 import { WASM_BASE64 } from './wasm_data';
 
-const WebDemuxer = (typeof window !== 'undefined' && (window as any).WebDemuxer) || DefaultWebDemuxer;
+type WindowWithMediaMocks = Window & typeof globalThis & {
+  WebDemuxer?: typeof DefaultWebDemuxer;
+  webkitAudioContext?: typeof AudioContext;
+  showSaveFilePicker?: (options?: {
+    suggestedName?: string;
+    types?: Array<{
+      description?: string;
+      accept: Record<string, string[]>;
+    }>;
+  }) => Promise<FileSystemFileHandle>;
+};
+
+type NavigatorWithDeviceMemory = Navigator & {
+  deviceMemory?: number;
+};
+
+type WorkerMessage =
+  | { type: 'UPDATE_UI'; payload: { passId: number; newStatus?: string; newProgress?: number } }
+  | { type: 'LOG'; payload: string }
+  | { type: 'DISK_WRITE'; payload: BlobPart }
+  | { type: 'COMPLETE'; payload?: BlobPart }
+  | { type: 'ERROR'; payload: string };
+
+const appWindow = typeof window !== 'undefined' ? (window as WindowWithMediaMocks) : undefined;
+const WebDemuxer = appWindow?.WebDemuxer || DefaultWebDemuxer;
 
 let cachedAppWasmUrl: string | null = null;
 const getAppWasmUrl = () => {
@@ -17,7 +41,7 @@ const getAppWasmUrl = () => {
 };
 
 if (typeof window !== 'undefined') {
-  (window as any).WebDemuxer = WebDemuxer;
+  (window as WindowWithMediaMocks).WebDemuxer = WebDemuxer;
 }
 
 import {
@@ -79,13 +103,8 @@ function App() {
     if (typeof window === 'undefined') return true;
     return !!(window.VideoEncoder && window.VideoFrame && window.OffscreenCanvas);
   });
-  const [loaded, setLoaded] = useState(false);
+  const [loaded] = useState(true);
   const [videos, setVideos] = useState<VideoFile[]>([]);
-
-  // ATOMIC PEAK: State Persistence
-  useEffect(() => {
-    setLoaded(true);
-  }, []);
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState('');
@@ -187,8 +206,13 @@ function App() {
       }
       setTotalDuration(duration);
     };
-    if (videos.length > 0) calculateDuration();
-    else setTotalDuration(0);
+    if (videos.length > 0) {
+      calculateDuration();
+      return;
+    }
+
+    const resetTimer = setTimeout(() => setTotalDuration(0), 0);
+    return () => clearTimeout(resetTimer);
   }, [videos]);
 
   useEffect(() => {
@@ -251,7 +275,11 @@ function App() {
       }
     };
 
-    const timer = setTimeout(renderPreview, 100);
+    const timer = setTimeout(() => {
+      renderPreview().catch((previewErr: unknown) => {
+        console.warn('[Preview] Render skipped:', previewErr instanceof Error ? previewErr.message : String(previewErr));
+      });
+    }, 100);
     return () => clearTimeout(timer);
   }, [previewTime, videos, processing]);
 
@@ -264,8 +292,7 @@ function App() {
       console.log('--- DEVICE DIAGNOSTICS ---');
       console.log('User Agent:', navigator.userAgent);
       console.log('Hardware Concurrency:', navigator.hardwareConcurrency);
-      // @ts-ignore
-      console.log('Device Memory:', navigator.deviceMemory, 'GB');
+      console.log('Device Memory:', (navigator as NavigatorWithDeviceMemory).deviceMemory ?? 'unknown', 'GB');
 
       const videoConfigs: VideoEncoderConfig[] = [
         { codec: 'avc1.42E028', width: 1920, height: 1080, bitrate: 5_000_000, framerate: 30 }, // Baseline
@@ -411,7 +438,7 @@ function App() {
   };
 
   useEffect(() => {
-    let stayAliveInterval: any = null;
+    let stayAliveInterval: ReturnType<typeof setInterval> | null = null;
     let audioCtx: AudioContext | null = null;
 
     const startStayAlive = () => {
@@ -419,7 +446,9 @@ function App() {
       console.log('[System] Activating Background Persistence...');
       
       try {
-        audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        const AudioContextConstructor = window.AudioContext || (window as WindowWithMediaMocks).webkitAudioContext;
+        if (!AudioContextConstructor) throw new Error('AudioContext is not available.');
+        audioCtx = new AudioContextConstructor();
         const oscillator = audioCtx.createOscillator();
         const gain = audioCtx.createGain();
         gain.gain.value = 0.001;
@@ -433,7 +462,7 @@ function App() {
 
       stayAliveInterval = setInterval(() => {
         if (processing) {
-          document.title = document.title;
+          document.documentElement.dataset.stitchActiveAt = String(Date.now());
         }
       }, 1000);
     };
@@ -443,6 +472,7 @@ function App() {
       if (audioCtx) audioCtx.close();
       stayAliveInterval = null;
       audioCtx = null;
+      delete document.documentElement.dataset.stitchActiveAt;
       console.log('[System] Background Persistence deactivated.');
     };
 
@@ -465,19 +495,20 @@ function App() {
   const handleConcatenate = async () => {
     if (videos.length < 2) { setError('Please add at least 2 videos.'); return; }
     
-    let diskWritable: any = null;
+    let diskWritable: FileSystemWritableFileStream | null = null;
     if (streamToDisk) {
       try {
-        const handle = await (window as any).showSaveFilePicker({
+        const handle = await (window as WindowWithMediaMocks).showSaveFilePicker?.({
           suggestedName: 'stitched_video.mp4',
           types: [{
             description: 'Video File',
             accept: { 'video/mp4': ['.mp4'] }
           }]
         });
+        if (!handle) throw new Error('Save picker is not available.');
         diskWritable = await handle.createWritable();
-      } catch (err: any) {
-        if (err.name === 'AbortError') return;
+      } catch (err: unknown) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
         setError(`Failed to start disk stream: ${err instanceof Error ? err.message : String(err)}`);
         return;
       }
@@ -500,7 +531,7 @@ function App() {
           for (const key of keys) await caches.delete(key);
         }
         window.location.reload();
-      } catch (e) {
+      } catch {
         window.location.href = window.location.origin + '?reset=' + Date.now();
       }
     };
@@ -534,7 +565,7 @@ function App() {
           startPass(true);
         }
       };
-      worker.onmessage = async (e) => {
+      worker.onmessage = async (e: MessageEvent<WorkerMessage>) => {
         const { type, payload } = e.data;
 
         if (type === 'UPDATE_UI') {
@@ -564,7 +595,7 @@ function App() {
                const probeDemuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
                await probeDemuxer.load(new File([blob], 'stitched.mp4'));
                const info = await probeDemuxer.getMediaInfo();
-               const hasAudio = info.streams.some((s: any) => s.codec_type_string === 'audio');
+               const hasAudio = info.streams.some((s: { codec_type_string?: string }) => s.codec_type_string === 'audio');
                if (hasAudio) {
                  console.log('[System] Verification: Audio track successfully muxed.');
                } else {
@@ -596,7 +627,11 @@ function App() {
           }
           
           if (diskWritable) {
-            try { await diskWritable.close(); } catch {}
+            try {
+              await diskWritable.close();
+            } catch (closeErr) {
+              console.warn('[System] Disk stream close failed:', closeErr);
+            }
             diskWritable = null;
           }
 
